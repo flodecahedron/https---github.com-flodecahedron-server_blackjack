@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { canSplit, fibonacci, handValue, isBlackjack } from "../src/blackjack.js";
+import { GameRoom } from "../src/game-room.js";
 
 const card = (rank) => ({ rank, suit: "spades" });
 
@@ -21,4 +22,15 @@ test("split requires matching ranks and available matching stake", () => {
 
 test("daily rewards follow Fibonacci", () => {
   assert.deepEqual([0, 1, 2, 3, 4, 5, 6].map(fibonacci), [0, 1, 1, 2, 3, 5, 8]);
+});
+
+test("first player receives a turn after the initial deal", () => {
+  const profile = { id: "player-1", username: "Test", balance: 1000 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: profile });
+  room.placeBet(profile.id, 10);
+  // draw() pops: player 10, dealer 10, player 7, dealer 6.
+  room.shoe = [card("6"), card("7"), card("10"), card("10")];
+  room.startIfReady();
+  assert.equal(room.phase, "player_turn");
+  assert.deepEqual(room.current, { playerId: profile.id, handIndex: 0 });
 });

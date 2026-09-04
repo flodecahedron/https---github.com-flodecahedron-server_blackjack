@@ -51,7 +51,8 @@ export class GameRoom {
     for (let i = 0; i < 2; i++) { for (const p of active) p.hands[0].cards.push(this.draw()); this.dealer.cards.push(this.draw()); }
     for (const player of active) if (isBlackjack(player.hands[0])) player.hands[0].status = "stood";
     if (isBlackjack(this.dealer)) { this.phase = "dealer_turn"; this.settle(); return true; }
-    this.phase = "player_turn"; this.current = { playerId: [...this.players.entries()].find(([,p]) => p.ready)?.[0], handIndex: 0 };
+    // advance() starts after current; begin just before hand 0.
+    this.phase = "player_turn"; this.current = { playerId: [...this.players.entries()].find(([,p]) => p.ready)?.[0], handIndex: -1 };
     this.advance(); return true;
   }
   draw() { return this.shoe.pop(); }
