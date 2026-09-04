@@ -12,10 +12,13 @@ export class GameRoom {
   player(id) { return this.players.get(id); }
   publicState(viewerId) {
     const revealDealer = ["dealer_turn", "settlement", "lobby"].includes(this.phase);
-    return { code: this.code, name: this.name, phase: this.phase, currentPlayerId: this.current?.playerId ?? null,
+    return { code: this.code, name: this.name, phase: this.phase, currentPlayerId: this.current?.playerId ?? null, currentHandIndex: this.current?.handIndex ?? -1,
       dealer: { ...this.dealer, cards: revealDealer ? this.dealer.cards : this.dealer.cards.map((card, i) => i ? { hidden: true } : card), value: revealDealer ? handValue(this.dealer.cards).total : null },
       players: [...this.players.entries()].map(([id, player]) => ({ id, name: player.profile.username, balance: player.profile.balance, ready: player.ready,
-        hands: player.hands.map((hand) => ({ ...hand, value: handValue(hand.cards).total, blackjack: isBlackjack(hand) })), self: id === viewerId })) };
+        hands: player.hands.map((hand) => ({ ...hand, value: handValue(hand.cards).total, blackjack: isBlackjack(hand),
+          canDouble: hand.status === "playing" && hand.cards.length === 2 && player.profile.balance >= hand.bet,
+          canSplit: hand.status === "playing" && canSplit(hand, player.profile.balance),
+          canSurrender: hand.status === "playing" && hand.cards.length === 2 && !hand.fromSplit })), self: id === viewerId })) };
   }
   addPlayer(profile) { if (this.phase !== "lobby" || this.players.size >= 5) throw Error("Room unavailable"); this.players.set(profile.id, { profile, hands: [], ready: false }); }
   removePlayer(id) { this.players.delete(id); if (id === this.hostId && this.players.size) this.hostId = this.players.keys().next().value; }
@@ -35,7 +38,10 @@ export class GameRoom {
       if (p.profile.balance /* balance before debit */ && this.dealerProfile().balance + existing + amount < (existing + amount) * 2.5) throw Error("Dealer bankroll cannot cover this bet");
       this.dealerProfile().balance += amount;
     }
-    p.hands = [{ cards: [], bet: amount, status: "playing" }]; p.profile.balance -= amount; p.ready = true;
+    if (!p.hands.length) p.hands = [{ cards: [], bet: 0, status: "playing", fromSplit: false }];
+    p.hands[0].bet += amount;
+    p.profile.balance -= amount;
+    p.ready = true;
   }
   startIfReady() {
     const active = [...this.players.values()].filter(p => p.ready && p.profile.id !== this.dealer.playerId);
@@ -53,7 +59,8 @@ export class GameRoom {
   hit(id) { const hand = this.assertTurn(id); hand.cards.push(this.draw()); if (handValue(hand.cards).total >= 21) { hand.status = "stood"; this.advance(); } }
   stand(id) { const hand = this.assertTurn(id); hand.status = "stood"; this.advance(); }
   double(id) { const hand = this.assertTurn(id); const p = this.player(id); if (hand.cards.length !== 2 || p.profile.balance < hand.bet) throw Error("Cannot double"); p.profile.balance -= hand.bet; hand.bet *= 2; hand.cards.push(this.draw()); hand.status = "stood"; this.advance(); }
-  split(id) { const hand = this.assertTurn(id); const p = this.player(id); if (!canSplit(hand, p.profile.balance)) throw Error("Cannot split"); p.profile.balance -= hand.bet; const second = { cards: [hand.cards.pop(), this.draw()], bet: hand.bet, status: "playing" }; hand.cards.push(this.draw()); p.hands.splice(this.current.handIndex + 1, 0, second); }
+  split(id) { const hand = this.assertTurn(id); const p = this.player(id); if (!canSplit(hand, p.profile.balance)) throw Error("Cannot split"); p.profile.balance -= hand.bet; const second = { cards: [hand.cards.pop(), this.draw()], bet: hand.bet, status: "playing", fromSplit: true }; hand.fromSplit = true; hand.cards.push(this.draw()); p.hands.splice(this.current.handIndex + 1, 0, second); }
+  surrender(id) { const hand = this.assertTurn(id); if (hand.cards.length !== 2 || hand.fromSplit) throw Error("Surrender is only available on the initial hand"); hand.status = "surrendered"; this.player(id).profile.balance += hand.bet / 2; this.advance(); }
   advance() {
     const entries = [...this.players.entries()].filter(([,p]) => p.ready);
     let pos = entries.findIndex(([id]) => id === this.current.playerId), handIndex = this.current.handIndex + 1;
@@ -81,7 +88,8 @@ export class GameRoom {
     const dealerValue = handValue(this.dealer.cards).total, dealerBJ = isBlackjack(this.dealer);
     for (const [, p] of this.players) if (p.ready) {
       for (const hand of p.hands) { const value = handValue(hand.cards).total; let payout = 0;
-        if (value > 21) payout = 0;
+        if (hand.status === "surrendered") payout = 0;
+        else if (value > 21) payout = 0;
         else if (isBlackjack(hand) && !dealerBJ) payout = hand.bet * 2.5;
         else if (dealerValue > 21 || value > dealerValue) payout = hand.bet * 2;
         else if (value === dealerValue) payout = hand.bet;
