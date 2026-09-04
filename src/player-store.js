@@ -10,6 +10,7 @@ export class PlayerStore {
   async initialize() {
     if (this.pool) {
       await this.pool.query("CREATE TABLE IF NOT EXISTS blackjack_players (id UUID PRIMARY KEY, username VARCHAR(16) UNIQUE NOT NULL, avatar TEXT NOT NULL DEFAULT '', balance INTEGER NOT NULL, login_streak INTEGER NOT NULL DEFAULT 0, last_login DATE)");
+      await this.pool.query("ALTER TABLE blackjack_players ALTER COLUMN balance TYPE INTEGER USING CEIL(balance)::INTEGER");
       return;
     }
     await mkdir(dirname(this.filePath), { recursive: true });

@@ -18,7 +18,7 @@ export function isBlackjack(hand) {
 }
 
 export function canSplit(hand, balance) {
-  return hand.cards.length === 2 && cardValue(hand.cards[0]) === cardValue(hand.cards[1]) && balance >= hand.bet;
+  return hand.cards.length === 2 && hand.cards[0].rank === hand.cards[1].rank && balance >= hand.bet;
 }
 
 export function createShoe(decks = 6) {

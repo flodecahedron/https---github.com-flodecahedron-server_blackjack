@@ -29,7 +29,7 @@ test("first player receives a turn after the initial deal", () => {
   const room = new GameRoom({ code: "1234", name: "TEST", host: profile });
   room.placeBet(profile.id, 10);
   // draw() pops: player 10, dealer 10, player 7, dealer 6.
-  room.shoe = [card("6"), card("7"), card("10"), card("10")];
+  room.shoe = [...Array.from({ length: 48 }, () => card("2")), card("6"), card("7"), card("10"), card("10")];
   room.startIfReady();
   assert.equal(room.phase, "player_turn");
   assert.deepEqual(room.current, { playerId: profile.id, handIndex: 0 });

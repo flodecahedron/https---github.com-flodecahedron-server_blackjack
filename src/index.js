@@ -10,7 +10,11 @@ const words = ["BLUE", "GOLD", "LIME", "STAR", "MOON", "WAVE", "FIRE", "ROSE", "
 const id = () => crypto.randomUUID();
 const send = (ws, type, payload) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ type, ...payload }));
 const fail = (ws, message) => send(ws, "error", { message });
-const roomCode = () => { let code; do code = String(Math.floor(1000 + Math.random() * 9000)); while (rooms.has(code)); return code; };
+const roomCode = () => {
+  const available = words.filter(word => !rooms.has(word));
+  if (!available.length) throw Error("Toutes les tables sont occupées");
+  return available[Math.floor(Math.random() * available.length)];
+};
 const broadcast = room => { for (const [playerId] of room.players) if (sockets.has(playerId)) send(sockets.get(playerId), "room_state", { room: room.publicState(playerId) }); };
 const saveRoomProfiles = room => Promise.all([...room.players.values()].map(player => store.save(player.profile, accounts)));
 
@@ -35,7 +39,7 @@ wss.on("connection", ws => {
       send(ws, "authenticated", { profile, dailyReward: reward }); return;
     }
     if (!profile) throw Error("Authentication required");
-    if (type === "create_room") { const room = new GameRoom({ code: roomCode(), name: words[Math.floor(Math.random() * words.length)], host: profile }); rooms.set(room.code, room); broadcast(room); return; }
+    if (type === "create_room") { const code = roomCode(); const room = new GameRoom({ code, name: code, host: profile }); rooms.set(room.code, room); broadcast(room); return; }
     if (type === "join_room") { const room = rooms.get(String(message.code)); if (!room) throw Error("Room not found"); room.addPlayer(profile); broadcast(room); return; }
     const room = [...rooms.values()].find(candidate => candidate.players.has(profile.id)); if (!room) throw Error("Join a room first");
     if (type === "bet") room.placeBet(profile.id, Number(message.amount));
