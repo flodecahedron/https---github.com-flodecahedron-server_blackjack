@@ -24,10 +24,16 @@ export class GameRoom {
   removePlayer(id) { this.players.delete(id); if (id === this.hostId && this.players.size) this.hostId = this.players.keys().next().value; }
   setDealer(id) {
     const player = this.player(id); if (!player || this.phase !== "lobby") throw Error("Unavailable");
+    if ([...this.players.values()].some(p => p.ready)) throw Error("Choose the dealer before bets are placed");
     // Human dealer needs a bankroll sufficient for every player blackjack payout (3:2).
     const exposure = [...this.players.values()].filter(p => p.profile.id !== id).reduce((sum, p) => sum + Math.ceil(p.profile.balance * 1.5), 0);
     if (player.profile.balance < exposure) throw Error("Insufficient bankroll to cover the table");
     this.dealer = { type: "player", playerId: id, name: player.profile.username, cards: [] };
+  }
+  removeDealer(id) {
+    if (this.phase !== "lobby" || this.dealer.type !== "player" || this.dealer.playerId !== id) throw Error("Unavailable");
+    if ([...this.players.values()].some(p => p.ready)) throw Error("Return to player before bets are placed");
+    this.dealer = { type: "bot", name: "Casino", bankroll: Infinity, cards: [] };
   }
   placeBet(id, amount) {
     if (this.phase !== "lobby") throw Error("Betting closed"); const p = this.player(id);
@@ -55,7 +61,7 @@ export class GameRoom {
       player.hands[0].status = "stood";
       this.addRoundEvent(player.profile.id, "blackjack");
     }
-    if (isBlackjack(this.dealer)) { this.phase = "dealer_turn"; this.settle(); return true; }
+    if (isBlackjack(this.dealer)) { this.addDealerEvent("blackjack"); this.phase = "dealer_turn"; this.settle(); return true; }
     // advance() starts after current; begin just before hand 0.
     this.phase = "player_turn"; this.current = { playerId: [...this.players.entries()].find(([,p]) => p.ready)?.[0], handIndex: -1 };
     this.advance(); return true;
@@ -64,9 +70,9 @@ export class GameRoom {
   assertTurn(id) { if (this.phase !== "player_turn" || this.current.playerId !== id) throw Error("Not your turn"); return this.player(id).hands[this.current.handIndex]; }
   hit(id) { const hand = this.assertTurn(id); hand.cards.push(this.draw()); this.recordTerminalHandEvent(id, hand); if (handValue(hand.cards).total >= 21) { hand.status = "stood"; this.advance(); } }
   stand(id) { const hand = this.assertTurn(id); hand.status = "stood"; this.advance(); }
-  double(id) { const hand = this.assertTurn(id); const p = this.player(id); if (hand.cards.length !== 2 || p.profile.balance < hand.bet) throw Error("Cannot double"); p.profile.balance -= hand.bet; hand.chips.push(hand.bet); hand.bet *= 2; hand.cards.push(this.draw()); this.recordTerminalHandEvent(id, hand); hand.status = "stood"; this.advance(); }
-  split(id) { const hand = this.assertTurn(id); const p = this.player(id); if (!canSplit(hand, p.profile.balance)) throw Error("Cannot split"); p.profile.balance -= hand.bet; const second = { cards: [hand.cards.pop(), this.draw()], chips: [...hand.chips], bet: hand.bet, status: "playing", fromSplit: true }; hand.fromSplit = true; hand.cards.push(this.draw()); p.hands.splice(this.current.handIndex + 1, 0, second); }
-  surrender(id) { const hand = this.assertTurn(id); if (hand.cards.length !== 2 || hand.fromSplit) throw Error("Surrender is only available on the initial hand"); hand.status = "surrendered"; this.player(id).profile.balance += Math.ceil(hand.bet / 2); this.advance(); }
+  double(id) { const hand = this.assertTurn(id); const p = this.player(id); if (hand.cards.length !== 2 || p.profile.balance < hand.bet) throw Error("Cannot double"); p.profile.balance -= hand.bet; if (this.dealer.type === "player") this.dealerProfile().balance += hand.bet; hand.chips.push(hand.bet); hand.bet *= 2; hand.cards.push(this.draw()); this.recordTerminalHandEvent(id, hand); hand.status = "stood"; this.advance(); }
+  split(id) { const hand = this.assertTurn(id); const p = this.player(id); if (!canSplit(hand, p.profile.balance)) throw Error("Cannot split"); p.profile.balance -= hand.bet; if (this.dealer.type === "player") this.dealerProfile().balance += hand.bet; const second = { cards: [hand.cards.pop(), this.draw()], chips: [...hand.chips], bet: hand.bet, status: "playing", fromSplit: true }; hand.fromSplit = true; hand.cards.push(this.draw()); p.hands.splice(this.current.handIndex + 1, 0, second); }
+  surrender(id) { const hand = this.assertTurn(id); if (hand.cards.length !== 2 || hand.fromSplit) throw Error("Surrender is only available on the initial hand"); hand.status = "surrendered"; this.advance(); }
   advance() {
     const entries = [...this.players.entries()].filter(([,p]) => p.ready);
     let pos = entries.findIndex(([id]) => id === this.current.playerId), handIndex = this.current.handIndex + 1;
@@ -77,12 +83,17 @@ export class GameRoom {
     this.phase = "dealer_turn";
     if (this.dealer.type === "player") { this.current = { playerId: this.dealer.playerId, dealer: true }; return; }
     while (handValue(this.dealer.cards).total < 17) this.dealer.cards.push(this.draw());
+    this.recordDealerTerminalEvent();
     this.settle();
   }
   dealerHit(id) {
     if (this.phase !== "dealer_turn" || this.dealer.playerId !== id) throw Error("Not the dealer turn");
     if (handValue(this.dealer.cards).total >= 17) throw Error("Dealer must stand on 17");
     this.dealer.cards.push(this.draw());
+    if (handValue(this.dealer.cards).total > 21) {
+      this.recordDealerTerminalEvent();
+      this.settle();
+    }
   }
   dealerStand(id) {
     if (this.phase !== "dealer_turn" || this.dealer.playerId !== id) throw Error("Not the dealer turn");
@@ -91,22 +102,28 @@ export class GameRoom {
   }
   dealerProfile() { return this.dealer.type === "player" ? this.player(this.dealer.playerId).profile : null; }
   addRoundEvent(playerId, type) { this.roundEvents.push({ id: this.nextEventId++, playerId, type }); }
+  addDealerEvent(type) { this.roundEvents.push({ id: this.nextEventId++, dealer: true, type }); }
   recordTerminalHandEvent(playerId, hand) { if (handValue(hand.cards).total > 21) this.addRoundEvent(playerId, "bust"); }
+  recordDealerTerminalEvent() { if (handValue(this.dealer.cards).total > 21) this.addDealerEvent("bust"); }
   settle() {
     const dealerValue = handValue(this.dealer.cards).total, dealerBJ = isBlackjack(this.dealer);
     for (const [playerId, p] of this.players) if (p.ready) {
       let net = 0, outcome = "push";
+      const handResults = [];
       for (const hand of p.hands) { const value = handValue(hand.cards).total; let payout = 0;
-        if (hand.status === "surrendered") { payout = 0; net = Math.ceil(-hand.bet / 2); outcome = "surrender"; }
-        else if (value > 21) { payout = 0; net -= hand.bet; outcome = "loss"; }
-        else if (isBlackjack(hand) && !dealerBJ) { payout = Math.ceil(hand.bet * 2.5); net += Math.ceil(hand.bet * 1.5); outcome = "blackjack"; }
-        else if (dealerValue > 21 || value > dealerValue) { payout = hand.bet * 2; net += hand.bet; outcome = "win"; }
+        if (hand.status === "surrendered") { payout = Math.ceil(hand.bet / 2); outcome = "surrender"; }
+        else if (value > 21) { outcome = "loss"; }
+        else if (isBlackjack(hand) && !dealerBJ) { payout = Math.ceil(hand.bet * 2.5); outcome = "blackjack"; }
+        else if (dealerValue > 21 || value > dealerValue) { payout = hand.bet * 2; outcome = "win"; }
         else if (value === dealerValue) { payout = hand.bet; outcome = "push"; }
-        else { net -= hand.bet; outcome = dealerBJ ? "dealer_blackjack" : "loss"; }
+        else { outcome = dealerBJ ? "dealer_blackjack" : "loss"; }
+        const handNet = payout - hand.bet;
+        net += handNet;
+        handResults.push({ outcome, net: handNet });
         p.profile.balance += payout;
         if (this.dealer.type === "player") this.dealerProfile().balance -= payout;
       }
-      this.roundResults.set(playerId, { outcome, net, dealerBlackjack: dealerBJ });
+      this.roundResults.set(playerId, { outcome, net, dealerBlackjack: dealerBJ, hands: handResults });
       if (p.profile.balance <= 0) p.profile.balance = 100;
       p.ready = false;
     }

@@ -53,3 +53,42 @@ test("a bust is published as a round event immediately", () => {
   room.hit(profile.id);
   assert.deepEqual(room.roundEvents.at(-1), { id: 1, playerId: profile.id, type: "bust" });
 });
+
+test("a human dealer receives a losing player's stake", () => {
+  const dealer = { id: "dealer", username: "Dealer", balance: 5000 };
+  const player = { id: "player", username: "Player", balance: 100 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: dealer });
+  room.addPlayer(player);
+  room.setDealer(dealer.id);
+  room.placeBet(player.id, 10);
+  room.player(player.id).hands[0].cards = [card("10"), card("6")];
+  room.dealer.cards = [card("10"), card("7")];
+  room.settle();
+  assert.equal(dealer.balance, 5010);
+  assert.equal(player.balance, 90);
+  assert.deepEqual(room.roundResults.get(player.id).hands, [{ outcome: "loss", net: -10 }]);
+});
+
+test("split hands settle independently against a human dealer", () => {
+  const dealer = { id: "dealer", username: "Dealer", balance: 5000 };
+  const player = { id: "player", username: "Player", balance: 100 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: dealer });
+  room.addPlayer(player);
+  room.setDealer(dealer.id);
+  room.placeBet(player.id, 10);
+  const playerState = room.player(player.id);
+  playerState.hands = [
+    { cards: [card("10"), card("10"), card("5")], chips: [10], bet: 10, status: "stood", fromSplit: true },
+    { cards: [card("10"), card("9")], chips: [10], bet: 10, status: "stood", fromSplit: true },
+  ];
+  player.balance -= 10;
+  dealer.balance += 10;
+  room.dealer.cards = [card("10"), card("7")];
+  room.settle();
+  assert.equal(dealer.balance, 5000);
+  assert.equal(player.balance, 100);
+  assert.deepEqual(room.roundResults.get(player.id).hands, [
+    { outcome: "loss", net: -10 },
+    { outcome: "win", net: 10 },
+  ]);
+});
