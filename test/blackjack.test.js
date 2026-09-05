@@ -34,3 +34,22 @@ test("first player receives a turn after the initial deal", () => {
   assert.equal(room.phase, "player_turn");
   assert.deepEqual(room.current, { playerId: profile.id, handIndex: 0 });
 });
+
+test("a bet below ten is valid and allows the round to start", () => {
+  const profile = { id: "player-1", username: "Test", balance: 1000 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: profile });
+  room.placeBet(profile.id, 1);
+  room.shoe = [...Array.from({ length: 48 }, () => card("2")), card("6"), card("7"), card("10"), card("10")];
+  room.startIfReady();
+  assert.equal(room.phase, "player_turn");
+});
+
+test("a bust is published as a round event immediately", () => {
+  const profile = { id: "player-1", username: "Test", balance: 1000 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: profile });
+  room.placeBet(profile.id, 1);
+  room.shoe = [...Array.from({ length: 47 }, () => card("2")), card("K"), card("6"), card("10"), card("10"), card("8")];
+  room.startIfReady();
+  room.hit(profile.id);
+  assert.deepEqual(room.roundEvents.at(-1), { id: 1, playerId: profile.id, type: "bust" });
+});

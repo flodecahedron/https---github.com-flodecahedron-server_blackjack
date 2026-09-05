@@ -1,19 +1,18 @@
 import { canSplit, createShoe, handValue, isBlackjack } from "./blackjack.js";
 
-const MIN_BET = 10;
-
 export class GameRoom {
   constructor({ code, name, host }) {
     this.code = code; this.name = name; this.hostId = host.id;
     this.players = new Map([[host.id, { profile: host, hands: [], ready: false }]]);
     this.dealer = { type: "bot", name: "Casino", bankroll: Infinity, cards: [] };
     this.shoe = createShoe(); this.phase = "lobby"; this.current = null; this.roundResults = new Map();
+    this.roundEvents = []; this.nextEventId = 1; this.hasCompletedRound = false;
   }
   player(id) { return this.players.get(id); }
   publicState(viewerId) {
     const revealDealer = ["dealer_turn", "settlement", "lobby"].includes(this.phase);
     const requiredPlayers = [...this.players.values()].filter(player => player.profile.id !== this.dealer.playerId);
-    return { code: this.code, name: this.name, phase: this.phase, currentPlayerId: this.current?.playerId ?? null, currentHandIndex: this.current?.handIndex ?? -1, readyCount: requiredPlayers.filter(player => player.ready).length, requiredCount: requiredPlayers.length,
+    return { code: this.code, name: this.name, phase: this.phase, currentPlayerId: this.current?.playerId ?? null, currentHandIndex: this.current?.handIndex ?? -1, readyCount: requiredPlayers.filter(player => player.ready).length, requiredCount: requiredPlayers.length, hasCompletedRound: this.hasCompletedRound, events: this.roundEvents,
       dealer: { ...this.dealer, cards: revealDealer ? this.dealer.cards : this.dealer.cards.map((card, i) => i ? { hidden: true } : card), value: revealDealer ? handValue(this.dealer.cards).total : null },
       players: [...this.players.entries()].map(([id, player]) => ({ id, name: player.profile.username, balance: player.profile.balance, ready: player.ready, result: this.roundResults.get(id) ?? null,
         hands: player.hands.map((hand) => ({ ...hand, value: handValue(hand.cards).total, blackjack: isBlackjack(hand),
@@ -48,11 +47,14 @@ export class GameRoom {
   startIfReady() {
     const required = [...this.players.values()].filter(p => p.profile.id !== this.dealer.playerId);
     const active = required.filter(p => p.ready);
-    if (!required.length || !required.every(p => p.ready && p.hands.length && p.hands[0].bet >= MIN_BET)) throw Error("Waiting for every player to validate a minimum bet");
+    if (!required.length || !required.every(p => p.ready && p.hands.length && p.hands[0].bet > 0)) throw Error("Waiting for every player to validate a bet");
     if (this.shoe.length < 52) this.shoe = createShoe();
-    this.dealer.cards = []; this.roundResults.clear();
+    this.dealer.cards = []; this.roundResults.clear(); this.roundEvents = [];
     for (let i = 0; i < 2; i++) { for (const p of active) p.hands[0].cards.push(this.draw()); this.dealer.cards.push(this.draw()); }
-    for (const player of active) if (isBlackjack(player.hands[0])) player.hands[0].status = "stood";
+    for (const player of active) if (isBlackjack(player.hands[0])) {
+      player.hands[0].status = "stood";
+      this.addRoundEvent(player.profile.id, "blackjack");
+    }
     if (isBlackjack(this.dealer)) { this.phase = "dealer_turn"; this.settle(); return true; }
     // advance() starts after current; begin just before hand 0.
     this.phase = "player_turn"; this.current = { playerId: [...this.players.entries()].find(([,p]) => p.ready)?.[0], handIndex: -1 };
@@ -60,9 +62,9 @@ export class GameRoom {
   }
   draw() { return this.shoe.pop(); }
   assertTurn(id) { if (this.phase !== "player_turn" || this.current.playerId !== id) throw Error("Not your turn"); return this.player(id).hands[this.current.handIndex]; }
-  hit(id) { const hand = this.assertTurn(id); hand.cards.push(this.draw()); if (handValue(hand.cards).total >= 21) { hand.status = "stood"; this.advance(); } }
+  hit(id) { const hand = this.assertTurn(id); hand.cards.push(this.draw()); this.recordTerminalHandEvent(id, hand); if (handValue(hand.cards).total >= 21) { hand.status = "stood"; this.advance(); } }
   stand(id) { const hand = this.assertTurn(id); hand.status = "stood"; this.advance(); }
-  double(id) { const hand = this.assertTurn(id); const p = this.player(id); if (hand.cards.length !== 2 || p.profile.balance < hand.bet) throw Error("Cannot double"); p.profile.balance -= hand.bet; hand.chips.push(hand.bet); hand.bet *= 2; hand.cards.push(this.draw()); hand.status = "stood"; this.advance(); }
+  double(id) { const hand = this.assertTurn(id); const p = this.player(id); if (hand.cards.length !== 2 || p.profile.balance < hand.bet) throw Error("Cannot double"); p.profile.balance -= hand.bet; hand.chips.push(hand.bet); hand.bet *= 2; hand.cards.push(this.draw()); this.recordTerminalHandEvent(id, hand); hand.status = "stood"; this.advance(); }
   split(id) { const hand = this.assertTurn(id); const p = this.player(id); if (!canSplit(hand, p.profile.balance)) throw Error("Cannot split"); p.profile.balance -= hand.bet; const second = { cards: [hand.cards.pop(), this.draw()], chips: [...hand.chips], bet: hand.bet, status: "playing", fromSplit: true }; hand.fromSplit = true; hand.cards.push(this.draw()); p.hands.splice(this.current.handIndex + 1, 0, second); }
   surrender(id) { const hand = this.assertTurn(id); if (hand.cards.length !== 2 || hand.fromSplit) throw Error("Surrender is only available on the initial hand"); hand.status = "surrendered"; this.player(id).profile.balance += Math.ceil(hand.bet / 2); this.advance(); }
   advance() {
@@ -88,6 +90,8 @@ export class GameRoom {
     this.settle();
   }
   dealerProfile() { return this.dealer.type === "player" ? this.player(this.dealer.playerId).profile : null; }
+  addRoundEvent(playerId, type) { this.roundEvents.push({ id: this.nextEventId++, playerId, type }); }
+  recordTerminalHandEvent(playerId, hand) { if (handValue(hand.cards).total > 21) this.addRoundEvent(playerId, "bust"); }
   settle() {
     const dealerValue = handValue(this.dealer.cards).total, dealerBJ = isBlackjack(this.dealer);
     for (const [playerId, p] of this.players) if (p.ready) {
@@ -108,5 +112,5 @@ export class GameRoom {
     }
     this.phase = "settlement"; this.current = null;
   }
-  nextRound() { if (this.phase !== "settlement") throw Error("Round not complete"); this.phase = "lobby"; this.dealer.cards = []; this.roundResults.clear(); for (const [,p] of this.players) p.hands = []; }
+  nextRound() { if (this.phase !== "settlement") throw Error("Round not complete"); this.phase = "lobby"; this.hasCompletedRound = true; this.dealer.cards = []; this.roundResults.clear(); this.roundEvents = []; for (const [,p] of this.players) p.hands = []; }
 }
