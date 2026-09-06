@@ -137,3 +137,36 @@ test("a player with no chips after settlement receives the casino safety grant",
   assert.equal(profile.balance, 100);
   assert.equal(room.roundEvents.at(-1).type, "casino_gift");
 });
+
+test("a player is restored to 100 chips when joining a room with no balance", () => {
+  const host = { id: "host", username: "Host", balance: 1000 };
+  const brokePlayer = { id: "broke", username: "Broke", balance: 0 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host });
+  room.addPlayer(brokePlayer);
+  assert.equal(brokePlayer.balance, 100);
+});
+
+test("spectating during betting refunds the player's stake", () => {
+  const host = { id: "host", username: "Host", balance: 1000 };
+  const player = { id: "player", username: "Player", balance: 100 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host });
+  room.addPlayer(player);
+  room.placeBet(player.id, 25);
+  room.becomeSpectator(player.id);
+  assert.equal(player.balance, 100);
+  assert.equal(room.players.has(player.id), false);
+  assert.equal(room.spectators.has(player.id), true);
+});
+
+test("a human dealer becoming spectator returns the dealer role to the casino", () => {
+  const dealer = { id: "dealer", username: "Dealer", balance: 1000 };
+  const player = { id: "player", username: "Player", balance: 100 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: dealer });
+  room.addPlayer(player);
+  room.setDealer(dealer.id);
+  room.placeBet(player.id, 20);
+  room.becomeSpectator(dealer.id);
+  assert.equal(room.dealer.type, "bot");
+  assert.equal(dealer.balance, 1000);
+  assert.equal(room.spectators.has(dealer.id), true);
+});

@@ -24,9 +24,36 @@ export class GameRoom {
           canSplit: hand.status === "playing" && canSplit(hand, player.profile.balance) && this.canAddStake(player, hand.bet),
           canSurrender: hand.status === "playing" && hand.cards.length === 2 && !hand.fromSplit })), self: id === viewerId })) };
   }
-  addPlayer(profile) { if (this.phase !== "lobby" || this.players.size >= 5) throw Error("Room unavailable"); this.spectators.delete(profile.id); this.players.set(profile.id, { profile, hands: [], ready: false }); }
-  addSpectator(profile) { this.spectators.set(profile.id, profile); }
-  becomeSpectator(id) { if (this.phase !== "lobby") throw Error("You can only spectate between rounds"); const player = this.player(id); if (!player) throw Error("Unavailable"); if (player.ready) throw Error("Cancel your bet before spectating"); this.players.delete(id); this.spectators.set(id, player.profile); }
+  ensureMinimumBalance(profile) { if (profile.balance <= 0) profile.balance = 100; }
+  addPlayer(profile) {
+    if (this.phase !== "lobby" || this.players.size >= 5) throw Error("Room unavailable");
+    this.ensureMinimumBalance(profile);
+    this.spectators.delete(profile.id);
+    this.players.set(profile.id, { profile, hands: [], ready: false });
+  }
+  addSpectator(profile) { this.ensureMinimumBalance(profile); this.spectators.set(profile.id, profile); }
+  refundLobbyBet(player) {
+    const refund = this.playerTotalBet(player);
+    player.profile.balance += refund;
+    if (this.dealer.type === "player") this.dealerProfile().balance -= refund;
+    player.hands = [];
+    player.ready = false;
+  }
+  releaseHumanDealer() {
+    if (this.dealer.type !== "player") return;
+    const dealerProfile = this.dealerProfile();
+    const tableStakes = [...this.players.values()].filter(player => player.profile.id !== this.dealer.playerId).reduce((sum, player) => sum + this.playerTotalBet(player), 0);
+    dealerProfile.balance -= tableStakes;
+    this.dealer = { type: "bot", name: "Casino", bankroll: Infinity, cards: [] };
+  }
+  becomeSpectator(id) {
+    if (this.phase !== "lobby") throw Error("You can only spectate between rounds");
+    const player = this.player(id); if (!player) throw Error("Unavailable");
+    if (this.dealer.type === "player" && this.dealer.playerId === id) this.releaseHumanDealer();
+    else this.refundLobbyBet(player);
+    this.players.delete(id);
+    this.spectators.set(id, player.profile);
+  }
   removePlayer(id) { this.players.delete(id); if (id === this.hostId && this.players.size) this.hostId = this.players.keys().next().value; }
   setDealer(id) {
     const player = this.player(id); if (!player || this.phase !== "lobby") throw Error("Unavailable");
@@ -36,7 +63,7 @@ export class GameRoom {
   removeDealer(id) {
     if (this.phase !== "lobby" || this.dealer.type !== "player" || this.dealer.playerId !== id) throw Error("Unavailable");
     if ([...this.players.values()].some(p => p.ready)) throw Error("Return to player before bets are placed");
-    this.dealer = { type: "bot", name: "Casino", bankroll: Infinity, cards: [] };
+    this.releaseHumanDealer();
   }
   placeBet(id, amount) {
     if (this.phase !== "lobby") throw Error("Betting closed"); const p = this.player(id);

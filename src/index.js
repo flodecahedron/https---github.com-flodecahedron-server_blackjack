@@ -59,15 +59,15 @@ wss.on("connection", ws => {
     }
     if (!profile) throw Error("Authentication required");
     if (type === "create_room") { const code = roomCode(); const room = new GameRoom({ code, name: code, host: profile, onUpdate: updatedRoom => void saveRoomProfiles(updatedRoom).then(() => broadcast(updatedRoom)) }); rooms.set(room.code, room); console.log(`[room] ${profile.username} created table ${code}`); broadcast(room); return; }
-    if (type === "join_room") { const room = rooms.get(String(message.code)); if (!room) throw Error("Room not found"); if (room.phase === "lobby") room.addPlayer(profile); else room.addSpectator(profile); console.log(`[room] ${profile.username} joined table ${room.code} as ${room.phase === "lobby" ? "player" : "spectator"}`); broadcast(room); return; }
+    if (type === "join_room") { const room = rooms.get(String(message.code)); if (!room) throw Error("Room not found"); if (room.phase === "lobby") room.addPlayer(profile); else room.addSpectator(profile); await store.save(profile, accounts); console.log(`[room] ${profile.username} joined table ${room.code} as ${room.phase === "lobby" ? "player" : "spectator"}`); broadcast(room); return; }
     const room = [...rooms.values()].find(candidate => candidate.players.has(profile.id) || candidate.spectators.has(profile.id)); if (!room) throw Error("Join a room first");
     if (type === "leave_room") {
       await removeFromRoom(room, profile);
       send(ws, "left_room", {});
       return;
     }
-    if (type === "take_seat") { room.addPlayer(profile); broadcast(room); return; }
-    if (type === "become_spectator") { room.becomeSpectator(profile.id); broadcast(room); return; }
+    if (type === "take_seat") { room.addPlayer(profile); await store.save(profile, accounts); broadcast(room); return; }
+    if (type === "become_spectator") { room.becomeSpectator(profile.id); await saveRoomProfiles(room); broadcast(room); return; }
     if (!room.players.has(profile.id)) throw Error("You are spectating this round");
     if (type === "bet") room.placeBet(profile.id, Number(message.amount));
     else if (type === "ready") room.readyPlayer(profile.id);
