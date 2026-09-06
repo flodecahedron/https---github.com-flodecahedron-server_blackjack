@@ -6,25 +6,22 @@ import { GameRoom } from "./game-room.js";
 import { PlayerStore } from "./player-store.js";
 
 const accounts = new Map(), rooms = new Map(), sockets = new Map(), store = new PlayerStore();
+const ROOM_CODES = ["ABLE", "BAKE", "BIRD", "BLUE", "BOLD", "CALM", "DARK", "DOVE", "EAST", "FIRE", "GOLD", "HILL", "JUMP", "LIME", "MOON", "ROSE", "SAND", "STAR", "WAVE", "WIND"];
 const id = () => crypto.randomUUID();
 const send = (ws, type, payload) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ type, ...payload }));
 const fail = (ws, message) => send(ws, "error", { message });
 const roomCode = () => {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-  // Four letters fit the mobile UI while providing 456,976 possible table codes.
-  for (let attempt = 0; attempt < 100; attempt++) {
-    const code = Array.from(crypto.randomBytes(4), byte => alphabet[byte % alphabet.length]).join("");
-    if (!rooms.has(code)) return code;
-  }
-  throw Error("Impossible de générer un code de table, réessayez");
+  const available = ROOM_CODES.filter(code => !rooms.has(code));
+  if (!available.length) throw Error("Toutes les tables sont occupées");
+  return available[crypto.randomInt(available.length)];
 };
-const broadcast = room => { for (const [playerId] of room.players) if (sockets.has(playerId)) send(sockets.get(playerId), "room_state", { room: room.publicState(playerId) }); };
+const broadcast = room => { for (const playerId of [...room.players.keys(), ...room.spectators.keys()]) if (sockets.has(playerId)) send(sockets.get(playerId), "room_state", { room: room.publicState(playerId) }); };
 const saveRoomProfiles = room => Promise.all([...room.players.values()].map(player => store.save(player.profile, accounts)));
 const removeFromRoom = async (room, profile) => {
   room.leavePlayer(profile.id);
   await store.save(profile, accounts);
   await saveRoomProfiles(room);
-  if (room.players.size) broadcast(room); else rooms.delete(room.code);
+  if (room.players.size || room.spectators.size) broadcast(room); else rooms.delete(room.code);
 };
 const replaceActiveSocket = (profileId, ws) => {
   const previous = sockets.get(profileId);
@@ -61,15 +58,19 @@ wss.on("connection", ws => {
       send(ws, "authenticated", { profile, dailyReward: reward }); return;
     }
     if (!profile) throw Error("Authentication required");
-    if (type === "create_room") { const code = roomCode(); const room = new GameRoom({ code, name: code, host: profile }); rooms.set(room.code, room); console.log(`[room] ${profile.username} created table ${code}`); broadcast(room); return; }
-    if (type === "join_room") { const room = rooms.get(String(message.code)); if (!room) throw Error("Room not found"); room.addPlayer(profile); console.log(`[room] ${profile.username} joined table ${room.code}`); broadcast(room); return; }
-    const room = [...rooms.values()].find(candidate => candidate.players.has(profile.id)); if (!room) throw Error("Join a room first");
+    if (type === "create_room") { const code = roomCode(); const room = new GameRoom({ code, name: code, host: profile, onUpdate: updatedRoom => void saveRoomProfiles(updatedRoom).then(() => broadcast(updatedRoom)) }); rooms.set(room.code, room); console.log(`[room] ${profile.username} created table ${code}`); broadcast(room); return; }
+    if (type === "join_room") { const room = rooms.get(String(message.code)); if (!room) throw Error("Room not found"); if (room.phase === "lobby") room.addPlayer(profile); else room.addSpectator(profile); console.log(`[room] ${profile.username} joined table ${room.code} as ${room.phase === "lobby" ? "player" : "spectator"}`); broadcast(room); return; }
+    const room = [...rooms.values()].find(candidate => candidate.players.has(profile.id) || candidate.spectators.has(profile.id)); if (!room) throw Error("Join a room first");
     if (type === "leave_room") {
       await removeFromRoom(room, profile);
       send(ws, "left_room", {});
       return;
     }
+    if (type === "take_seat") { room.addPlayer(profile); broadcast(room); return; }
+    if (type === "become_spectator") { room.becomeSpectator(profile.id); broadcast(room); return; }
+    if (!room.players.has(profile.id)) throw Error("You are spectating this round");
     if (type === "bet") room.placeBet(profile.id, Number(message.amount));
+    else if (type === "ready") room.readyPlayer(profile.id);
     else if (type === "start") room.startIfReady(); else if (type === "hit") room.hit(profile.id); else if (type === "stand") room.stand(profile.id); else if (type === "dealer_hit") room.dealerHit(profile.id); else if (type === "dealer_stand") room.dealerStand(profile.id); else if (type === "double") room.double(profile.id); else if (type === "split") room.split(profile.id); else if (type === "surrender") room.surrender(profile.id); else if (type === "next_round") room.nextRound(); else if (type === "become_dealer") room.setDealer(profile.id); else if (type === "leave_dealer") room.removeDealer(profile.id); else throw Error("Unknown action");
     await saveRoomProfiles(room); broadcast(room);
   } catch (error) {
@@ -81,7 +82,7 @@ wss.on("connection", ws => {
     if (!profile || sockets.get(profile.id) !== ws) return;
     console.log(`[player] ${profile.username} disconnected`);
     sockets.delete(profile.id);
-    for (const room of rooms.values()) if (room.players.has(profile.id)) void removeFromRoom(room, profile);
+    for (const room of rooms.values()) if (room.players.has(profile.id) || room.spectators.has(profile.id)) void removeFromRoom(room, profile);
   });
 });
 

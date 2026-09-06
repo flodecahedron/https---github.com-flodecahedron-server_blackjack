@@ -28,6 +28,7 @@ test("first player receives a turn after the initial deal", () => {
   const profile = { id: "player-1", username: "Test", balance: 1000 };
   const room = new GameRoom({ code: "1234", name: "TEST", host: profile });
   room.placeBet(profile.id, 10);
+  room.player(profile.id).ready = true;
   // draw() pops: player 10, dealer 10, player 7, dealer 6.
   room.shoe = [...Array.from({ length: 48 }, () => card("2")), card("6"), card("7"), card("10"), card("10")];
   room.startIfReady();
@@ -39,6 +40,7 @@ test("a bet below ten is valid and allows the round to start", () => {
   const profile = { id: "player-1", username: "Test", balance: 1000 };
   const room = new GameRoom({ code: "1234", name: "TEST", host: profile });
   room.placeBet(profile.id, 1);
+  room.player(profile.id).ready = true;
   room.shoe = [...Array.from({ length: 48 }, () => card("2")), card("6"), card("7"), card("10"), card("10")];
   room.startIfReady();
   assert.equal(room.phase, "player_turn");
@@ -48,6 +50,7 @@ test("a bust is published as a round event immediately", () => {
   const profile = { id: "player-1", username: "Test", balance: 1000 };
   const room = new GameRoom({ code: "1234", name: "TEST", host: profile });
   room.placeBet(profile.id, 1);
+  room.player(profile.id).ready = true;
   room.shoe = [...Array.from({ length: 47 }, () => card("2")), card("K"), card("6"), card("10"), card("10"), card("8")];
   room.startIfReady();
   room.hit(profile.id);
@@ -61,6 +64,7 @@ test("a human dealer receives a losing player's stake", () => {
   room.addPlayer(player);
   room.setDealer(dealer.id);
   room.placeBet(player.id, 10);
+  room.player(player.id).ready = true;
   room.player(player.id).hands[0].cards = [card("10"), card("6")];
   room.dealer.cards = [card("10"), card("7")];
   room.settle();
@@ -76,6 +80,7 @@ test("split hands settle independently against a human dealer", () => {
   room.addPlayer(player);
   room.setDealer(dealer.id);
   room.placeBet(player.id, 10);
+  room.player(player.id).ready = true;
   const playerState = room.player(player.id);
   playerState.hands = [
     { cards: [card("10"), card("10"), card("5")], chips: [10], bet: 10, status: "stood", fromSplit: true },
@@ -110,6 +115,7 @@ test("leaving human dealer pays every active player as a winner", () => {
   room.addPlayer(player);
   room.setDealer(dealer.id);
   room.placeBet(player.id, 10);
+  room.player(player.id).ready = true;
   room.phase = "player_turn";
   room.current = { playerId: player.id, handIndex: 0 };
   room.leavePlayer(dealer.id);
