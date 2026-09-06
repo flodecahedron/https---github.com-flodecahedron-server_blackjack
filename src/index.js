@@ -38,6 +38,7 @@ const server = http.createServer((req, res) => { res.writeHead(req.url === "/hea
 const wss = new WebSocketServer({ server });
 wss.on("connection", ws => {
   let profile = null;
+  console.log("[socket] Client connected");
   ws.on("message", async raw => { try {
     const message = JSON.parse(raw); const { type } = message;
     if (type === "register") {
@@ -47,16 +48,18 @@ wss.on("connection", ws => {
       profile = { id: id(), username, avatar: String(message.avatar ?? ""), balance: 1000, loginStreak: 0, lastLogin: null };
       accounts.set(profile.id, profile); replaceActiveSocket(profile.id, ws);
       const reward = dailyReward(profile); await store.save(profile, accounts);
+      console.log(`[player] ${profile.username} created an account and connected`);
       send(ws, "authenticated", { profile, dailyReward: reward }); return;
     }
     if (type === "login") {
       profile = accounts.get(String(message.accountId)); if (!profile) throw Error("Compte introuvable");
       replaceActiveSocket(profile.id, ws); const reward = dailyReward(profile); await store.save(profile, accounts);
+      console.log(`[player] ${profile.username} connected`);
       send(ws, "authenticated", { profile, dailyReward: reward }); return;
     }
     if (!profile) throw Error("Authentication required");
-    if (type === "create_room") { const code = roomCode(); const room = new GameRoom({ code, name: code, host: profile }); rooms.set(room.code, room); broadcast(room); return; }
-    if (type === "join_room") { const room = rooms.get(String(message.code)); if (!room) throw Error("Room not found"); room.addPlayer(profile); broadcast(room); return; }
+    if (type === "create_room") { const code = roomCode(); const room = new GameRoom({ code, name: code, host: profile }); rooms.set(room.code, room); console.log(`[room] ${profile.username} created table ${code}`); broadcast(room); return; }
+    if (type === "join_room") { const room = rooms.get(String(message.code)); if (!room) throw Error("Room not found"); room.addPlayer(profile); console.log(`[room] ${profile.username} joined table ${room.code}`); broadcast(room); return; }
     const room = [...rooms.values()].find(candidate => candidate.players.has(profile.id)); if (!room) throw Error("Join a room first");
     if (type === "leave_room") {
       await removeFromRoom(room, profile);
@@ -70,6 +73,7 @@ wss.on("connection", ws => {
   ws.on("close", () => {
     // Do not remove a player when an older socket closes after a reconnect.
     if (!profile || sockets.get(profile.id) !== ws) return;
+    console.log(`[player] ${profile.username} disconnected`);
     sockets.delete(profile.id);
     for (const room of rooms.values()) if (room.players.has(profile.id)) void removeFromRoom(room, profile);
   });
