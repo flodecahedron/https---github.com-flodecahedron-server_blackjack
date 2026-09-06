@@ -16,7 +16,10 @@ const roomCode = () => {
   return available[crypto.randomInt(available.length)];
 };
 const broadcast = room => { for (const playerId of [...room.players.keys(), ...room.spectators.keys()]) if (sockets.has(playerId)) send(sockets.get(playerId), "room_state", { room: room.publicState(playerId) }); };
-const saveRoomProfiles = room => Promise.all([...room.players.values()].map(player => store.save(player.profile, accounts)));
+const saveRoomProfiles = room => Promise.all([
+  ...[...room.players.values()].map(player => player.profile),
+  ...room.spectators.values(),
+].map(profile => store.save(profile, accounts)));
 const removeFromRoom = async (room, profile) => {
   room.leavePlayer(profile.id);
   await store.save(profile, accounts);
@@ -71,6 +74,7 @@ wss.on("connection", ws => {
     if (!room.players.has(profile.id)) throw Error("You are spectating this round");
     if (type === "bet") room.placeBet(profile.id, Number(message.amount));
     else if (type === "ready") room.readyPlayer(profile.id);
+    else if (type === "unready") room.unreadyPlayer(profile.id);
     else if (type === "start") room.startIfReady(); else if (type === "hit") room.hit(profile.id); else if (type === "stand") room.stand(profile.id); else if (type === "dealer_hit") room.dealerHit(profile.id); else if (type === "dealer_stand") room.dealerStand(profile.id); else if (type === "double") room.double(profile.id); else if (type === "split") room.split(profile.id); else if (type === "surrender") room.surrender(profile.id); else if (type === "next_round") room.nextRound(); else if (type === "become_dealer") room.setDealer(profile.id); else if (type === "leave_dealer") room.removeDealer(profile.id); else throw Error("Unknown action");
     await saveRoomProfiles(room); broadcast(room);
   } catch (error) {

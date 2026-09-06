@@ -191,3 +191,27 @@ test("a human dealer must complete a round before leaving the role", () => {
   room.removeDealer(dealer.id);
   assert.equal(room.dealer.type, "bot");
 });
+
+test("betting timeout refunds an unready player before spectating", () => {
+  const host = { id: "host", username: "Host", balance: 1000 };
+  const player = { id: "player", username: "Player", balance: 100 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host });
+  room.addPlayer(player);
+  room.placeBet(player.id, 25);
+  room.expireBetting();
+  assert.equal(player.balance, 100);
+  assert.equal(room.players.has(player.id), false);
+  assert.equal(room.spectators.has(player.id), true);
+});
+
+test("a ready player can cancel readiness during betting", () => {
+  const host = { id: "host", username: "Host", balance: 100 };
+  const player = { id: "player", username: "Player", balance: 100 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host });
+  room.addPlayer(player);
+  room.placeBet(host.id, 10);
+  room.placeBet(player.id, 10);
+  room.readyPlayer(host.id);
+  room.unreadyPlayer(host.id);
+  assert.equal(room.player(host.id).ready, false);
+});

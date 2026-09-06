@@ -21,6 +21,12 @@ export function canSplit(hand, balance) {
   return hand.cards.length === 2 && cardValue(hand.cards[0]) === cardValue(hand.cards[1]) && balance >= hand.bet;
 }
 
+export function handScores(cards) {
+  const best = handValue(cards).total;
+  const high = cards.reduce((sum, card) => sum + cardValue(card), 0);
+  return high <= 21 && high !== best ? [best, high] : [best];
+}
+
 export function createShoe(decks = 6) {
   const cards = [];
   for (let deck = 0; deck < decks; deck++) {

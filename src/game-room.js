@@ -1,4 +1,4 @@
-import { canSplit, createShoe, handValue, isBlackjack } from "./blackjack.js";
+import { canSplit, createShoe, handScores, handValue, isBlackjack } from "./blackjack.js";
 
 export class GameRoom {
   constructor({ code, name, host, onUpdate = null }) {
@@ -17,9 +17,9 @@ export class GameRoom {
     const revealDealer = ["dealer_turn", "settlement", "lobby"].includes(this.phase);
     const requiredPlayers = [...this.players.values()].filter(player => player.profile.id !== this.dealer.playerId);
     return { code: this.code, name: this.name, phase: this.phase, currentPlayerId: this.current?.playerId ?? null, currentHandIndex: this.current?.handIndex ?? -1, readyCount: requiredPlayers.filter(player => player.ready).length, requiredCount: requiredPlayers.length, hasCompletedRound: this.hasCompletedRound, events: this.roundEvents, timerEndsAt: this.timerEndsAt ?? null, viewerRole: this.players.has(viewerId) ? "player" : "spectator", spectators: [...this.spectators.values()].map(profile => profile.username),
-      dealer: { ...this.dealer, canLeaveRole: this.phase === "lobby" && this.dealer.type === "player" && this.dealer.hasCompletedRound, cards: revealDealer ? this.dealer.cards : this.dealer.cards.map((card, i) => i ? { hidden: true } : card), value: revealDealer ? handValue(this.dealer.cards).total : null },
+      dealer: { ...this.dealer, canLeaveRole: this.phase === "lobby" && this.dealer.type === "player" && this.dealer.hasCompletedRound, cards: revealDealer ? this.dealer.cards : this.dealer.cards.map((card, i) => i ? { hidden: true } : card), value: revealDealer ? handValue(this.dealer.cards).total : null, scores: revealDealer ? handScores(this.dealer.cards) : [] },
       players: [...this.players.entries()].map(([id, player]) => ({ id, name: player.profile.username, balance: player.profile.balance, ready: player.ready, result: this.roundResults.get(id) ?? null,
-        hands: player.hands.map((hand) => ({ ...hand, value: handValue(hand.cards).total, blackjack: isBlackjack(hand),
+        hands: player.hands.map((hand) => ({ ...hand, value: handValue(hand.cards).total, scores: handScores(hand.cards), blackjack: isBlackjack(hand),
           canDouble: hand.status === "playing" && hand.cards.length === 2 && player.profile.balance >= hand.bet && this.canAddStake(player, hand.bet),
           canSplit: hand.status === "playing" && canSplit(hand, player.profile.balance) && this.canAddStake(player, hand.bet),
           canSurrender: hand.status === "playing" && hand.cards.length === 2 && !hand.fromSplit })), self: id === viewerId })) };
@@ -71,7 +71,7 @@ export class GameRoom {
   }
   placeBet(id, amount) {
     if (this.phase !== "lobby") throw Error("Betting closed"); const p = this.player(id);
-    if (!p || this.dealer.playerId === id || !Number.isInteger(amount) || amount < 1 || amount > p.profile.balance) throw Error("Invalid bet");
+    if (!p || p.ready || this.dealer.playerId === id || !Number.isInteger(amount) || amount < 1 || amount > p.profile.balance) throw Error("Invalid bet");
     if (!this.canAddStake(p, amount)) throw Error("This bet exceeds the dealer's table limit");
     if (this.dealer.type === "player") this.dealerProfile().balance += amount;
     if (!p.hands.length) p.hands = [{ cards: [], chips: [], bet: 0, status: "playing", fromSplit: false }];
@@ -88,6 +88,12 @@ export class GameRoom {
     const required = [...this.players.values()].filter(p => p.profile.id !== this.dealer.playerId);
     if (required.length && required.every(p => p.ready)) this.startIfReady();
   }
+  unreadyPlayer(id) {
+    if (this.phase !== "lobby") throw Error("Betting closed");
+    const player = this.player(id);
+    if (!player || !player.ready) throw Error("Player is not ready");
+    player.ready = false;
+  }
   startBetTimer() {
     const required = [...this.players.values()].filter(p => p.profile.id !== this.dealer.playerId);
     if (required.length <= 1 || this.betTimer) return;
@@ -95,14 +101,18 @@ export class GameRoom {
     this.betTimer = this.schedule(() => {
       this.betTimer = null;
       this.timerEndsAt = null;
-      for (const [id, player] of this.players) if (id !== this.dealer.playerId && !player.ready) {
-        this.players.delete(id);
-        this.spectators.set(id, player.profile);
-      }
-      const active = [...this.players.values()].filter(p => p.profile.id !== this.dealer.playerId && p.ready);
-      if (active.length) this.startIfReady();
+      this.expireBetting();
       this.notify();
     }, 60_000);
+  }
+  expireBetting() {
+    for (const [id, player] of this.players) if (id !== this.dealer.playerId && !player.ready) {
+      this.refundLobbyBet(player);
+      this.players.delete(id);
+      this.spectators.set(id, player.profile);
+    }
+    const active = [...this.players.values()].filter(p => p.profile.id !== this.dealer.playerId && p.ready);
+    if (active.length) this.startIfReady();
   }
   startIfReady() {
     const required = [...this.players.values()].filter(p => p.profile.id !== this.dealer.playerId);
