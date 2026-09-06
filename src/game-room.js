@@ -81,16 +81,15 @@ export class GameRoom {
   }
   dealerHit(id) {
     if (this.phase !== "dealer_turn" || this.dealer.playerId !== id) throw Error("Not the dealer turn");
-    if (handValue(this.dealer.cards).total >= 17) throw Error("Dealer must stand on 17");
+    if (handValue(this.dealer.cards).total >= 21) throw Error("Dealer turn is complete");
     this.dealer.cards.push(this.draw());
-    if (handValue(this.dealer.cards).total > 21) {
+    if (handValue(this.dealer.cards).total >= 21) {
       this.recordDealerTerminalEvent();
       this.settle();
     }
   }
   dealerStand(id) {
     if (this.phase !== "dealer_turn" || this.dealer.playerId !== id) throw Error("Not the dealer turn");
-    if (handValue(this.dealer.cards).total < 17) throw Error("Dealer must draw until 17");
     this.settle();
   }
   dealerProfile() { return this.dealer.type === "player" ? this.player(this.dealer.playerId).profile : null; }
