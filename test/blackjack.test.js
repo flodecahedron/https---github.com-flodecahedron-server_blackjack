@@ -17,6 +17,7 @@ test("natural blackjack has exactly two cards", () => {
 
 test("split requires matching ranks and available matching stake", () => {
   assert.equal(canSplit({ cards: [card("8"), card("8")], bet: 20 }, 20), true);
+  assert.equal(canSplit({ cards: [card("10"), card("K")], bet: 20 }, 20), true);
   assert.equal(canSplit({ cards: [card("8"), card("9")], bet: 20 }, 20), false);
 });
 
@@ -123,4 +124,16 @@ test("leaving human dealer pays every active player as a winner", () => {
   assert.equal(player.balance, 110);
   assert.equal(dealer.balance, 4990);
   assert.deepEqual(room.roundResults.get(player.id).hands, [{ outcome: "win", net: 10 }]);
+});
+
+test("a player with no chips after settlement receives the casino safety grant", () => {
+  const profile = { id: "player-1", username: "Test", balance: 1 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: profile });
+  room.placeBet(profile.id, 1);
+  room.player(profile.id).ready = true;
+  room.player(profile.id).hands[0].cards = [card("10"), card("8"), card("K")];
+  room.dealer.cards = [card("10"), card("7")];
+  room.settle();
+  assert.equal(profile.balance, 100);
+  assert.equal(room.roundEvents.at(-1).type, "casino_gift");
 });
