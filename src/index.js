@@ -20,6 +20,12 @@ const roomCode = () => {
 };
 const broadcast = room => { for (const [playerId] of room.players) if (sockets.has(playerId)) send(sockets.get(playerId), "room_state", { room: room.publicState(playerId) }); };
 const saveRoomProfiles = room => Promise.all([...room.players.values()].map(player => store.save(player.profile, accounts)));
+const removeFromRoom = async (room, profile) => {
+  room.leavePlayer(profile.id);
+  await store.save(profile, accounts);
+  await saveRoomProfiles(room);
+  if (room.players.size) broadcast(room); else rooms.delete(room.code);
+};
 const replaceActiveSocket = (profileId, ws) => {
   const previous = sockets.get(profileId);
   sockets.set(profileId, ws);
@@ -52,6 +58,11 @@ wss.on("connection", ws => {
     if (type === "create_room") { const code = roomCode(); const room = new GameRoom({ code, name: code, host: profile }); rooms.set(room.code, room); broadcast(room); return; }
     if (type === "join_room") { const room = rooms.get(String(message.code)); if (!room) throw Error("Room not found"); room.addPlayer(profile); broadcast(room); return; }
     const room = [...rooms.values()].find(candidate => candidate.players.has(profile.id)); if (!room) throw Error("Join a room first");
+    if (type === "leave_room") {
+      await removeFromRoom(room, profile);
+      send(ws, "left_room", {});
+      return;
+    }
     if (type === "bet") room.placeBet(profile.id, Number(message.amount));
     else if (type === "start") room.startIfReady(); else if (type === "hit") room.hit(profile.id); else if (type === "stand") room.stand(profile.id); else if (type === "dealer_hit") room.dealerHit(profile.id); else if (type === "dealer_stand") room.dealerStand(profile.id); else if (type === "double") room.double(profile.id); else if (type === "split") room.split(profile.id); else if (type === "surrender") room.surrender(profile.id); else if (type === "next_round") room.nextRound(); else if (type === "become_dealer") room.setDealer(profile.id); else if (type === "leave_dealer") room.removeDealer(profile.id); else throw Error("Unknown action");
     await saveRoomProfiles(room); broadcast(room);
@@ -60,11 +71,7 @@ wss.on("connection", ws => {
     // Do not remove a player when an older socket closes after a reconnect.
     if (!profile || sockets.get(profile.id) !== ws) return;
     sockets.delete(profile.id);
-    for (const room of rooms.values()) if (room.players.has(profile.id)) {
-      room.removePlayer(profile.id);
-      broadcast(room);
-      if (!room.players.size) rooms.delete(room.code);
-    }
+    for (const room of rooms.values()) if (room.players.has(profile.id)) void removeFromRoom(room, profile);
   });
 });
 

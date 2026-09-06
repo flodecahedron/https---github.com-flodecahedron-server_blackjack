@@ -92,3 +92,29 @@ test("split hands settle independently against a human dealer", () => {
     { outcome: "win", net: 10 },
   ]);
 });
+
+test("dealer bankroll sets a per-player bet cap that covers blackjack", () => {
+  const dealer = { id: "dealer", username: "Dealer", balance: 150 };
+  const player = { id: "player", username: "Player", balance: 1000 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: dealer });
+  room.addPlayer(player);
+  room.setDealer(dealer.id);
+  room.placeBet(player.id, 100);
+  assert.throws(() => room.placeBet(player.id, 1), /table limit/);
+});
+
+test("leaving human dealer pays every active player as a winner", () => {
+  const dealer = { id: "dealer", username: "Dealer", balance: 5000 };
+  const player = { id: "player", username: "Player", balance: 100 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: dealer });
+  room.addPlayer(player);
+  room.setDealer(dealer.id);
+  room.placeBet(player.id, 10);
+  room.phase = "player_turn";
+  room.current = { playerId: player.id, handIndex: 0 };
+  room.leavePlayer(dealer.id);
+  assert.equal(room.phase, "settlement");
+  assert.equal(player.balance, 110);
+  assert.equal(dealer.balance, 4990);
+  assert.deepEqual(room.roundResults.get(player.id).hands, [{ outcome: "win", net: 10 }]);
+});
