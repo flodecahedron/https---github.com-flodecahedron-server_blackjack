@@ -17,7 +17,7 @@ export class GameRoom {
     const revealDealer = ["dealer_turn", "settlement", "lobby"].includes(this.phase);
     const requiredPlayers = [...this.players.values()].filter(player => player.profile.id !== this.dealer.playerId);
     return { code: this.code, name: this.name, phase: this.phase, currentPlayerId: this.current?.playerId ?? null, currentHandIndex: this.current?.handIndex ?? -1, readyCount: requiredPlayers.filter(player => player.ready).length, requiredCount: requiredPlayers.length, hasCompletedRound: this.hasCompletedRound, events: this.roundEvents, timerEndsAt: this.timerEndsAt ?? null, viewerRole: this.players.has(viewerId) ? "player" : "spectator", spectators: [...this.spectators.values()].map(profile => profile.username),
-      dealer: { ...this.dealer, cards: revealDealer ? this.dealer.cards : this.dealer.cards.map((card, i) => i ? { hidden: true } : card), value: revealDealer ? handValue(this.dealer.cards).total : null },
+      dealer: { ...this.dealer, canLeaveRole: this.phase === "lobby" && this.dealer.type === "player" && this.dealer.hasCompletedRound, cards: revealDealer ? this.dealer.cards : this.dealer.cards.map((card, i) => i ? { hidden: true } : card), value: revealDealer ? handValue(this.dealer.cards).total : null },
       players: [...this.players.entries()].map(([id, player]) => ({ id, name: player.profile.username, balance: player.profile.balance, ready: player.ready, result: this.roundResults.get(id) ?? null,
         hands: player.hands.map((hand) => ({ ...hand, value: handValue(hand.cards).total, blackjack: isBlackjack(hand),
           canDouble: hand.status === "playing" && hand.cards.length === 2 && player.profile.balance >= hand.bet && this.canAddStake(player, hand.bet),
@@ -49,7 +49,10 @@ export class GameRoom {
   becomeSpectator(id) {
     if (this.phase !== "lobby") throw Error("You can only spectate between rounds");
     const player = this.player(id); if (!player) throw Error("Unavailable");
-    if (this.dealer.type === "player" && this.dealer.playerId === id) this.releaseHumanDealer();
+    if (this.dealer.type === "player" && this.dealer.playerId === id) {
+      if (!this.dealer.hasCompletedRound) throw Error("Play one round as dealer before changing role");
+      this.releaseHumanDealer();
+    }
     else this.refundLobbyBet(player);
     this.players.delete(id);
     this.spectators.set(id, player.profile);
@@ -57,12 +60,13 @@ export class GameRoom {
   removePlayer(id) { this.players.delete(id); if (id === this.hostId && this.players.size) this.hostId = this.players.keys().next().value; }
   setDealer(id) {
     const player = this.player(id); if (!player || this.phase !== "lobby") throw Error("Unavailable");
-    if ([...this.players.values()].some(p => p.ready)) throw Error("Choose the dealer before bets are placed");
-    this.dealer = { type: "player", playerId: id, name: player.profile.username, bankroll: player.profile.balance, cards: [] };
+    if ([...this.players.values()].some(p => this.playerTotalBet(p) > 0)) throw Error("Choose the dealer before any bet is placed");
+    this.dealer = { type: "player", playerId: id, name: player.profile.username, bankroll: player.profile.balance, hasCompletedRound: false, cards: [] };
   }
   removeDealer(id) {
     if (this.phase !== "lobby" || this.dealer.type !== "player" || this.dealer.playerId !== id) throw Error("Unavailable");
-    if ([...this.players.values()].some(p => p.ready)) throw Error("Return to player before bets are placed");
+    if (!this.dealer.hasCompletedRound) throw Error("Play one round as dealer before becoming a player again");
+    if ([...this.players.values()].some(p => this.playerTotalBet(p) > 0)) throw Error("Return to player before bets are placed");
     this.releaseHumanDealer();
   }
   placeBet(id, amount) {
@@ -252,6 +256,7 @@ export class GameRoom {
       }
       p.ready = false;
     }
+    if (this.dealer.type === "player") this.dealer.hasCompletedRound = true;
     this.phase = "settlement"; this.current = null;
   }
   nextRound() { if (this.phase !== "settlement") throw Error("Round not complete"); this.phase = "lobby"; this.hasCompletedRound = true; this.dealer.cards = []; this.roundResults.clear(); this.roundEvents = []; for (const [,p] of this.players) p.hands = []; }

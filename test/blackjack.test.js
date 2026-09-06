@@ -170,3 +170,24 @@ test("a human dealer becoming spectator returns the dealer role to the casino", 
   assert.equal(dealer.balance, 1000);
   assert.equal(room.spectators.has(dealer.id), true);
 });
+
+test("a player cannot become dealer after a bet is placed", () => {
+  const host = { id: "host", username: "Host", balance: 1000 };
+  const player = { id: "player", username: "Player", balance: 100 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host });
+  room.addPlayer(player);
+  room.placeBet(player.id, 10);
+  assert.throws(() => room.setDealer(host.id), /before any bet/);
+});
+
+test("a human dealer must complete a round before leaving the role", () => {
+  const dealer = { id: "dealer", username: "Dealer", balance: 1000 };
+  const player = { id: "player", username: "Player", balance: 100 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: dealer });
+  room.addPlayer(player);
+  room.setDealer(dealer.id);
+  assert.throws(() => room.removeDealer(dealer.id), /Play one round/);
+  room.dealer.hasCompletedRound = true;
+  room.removeDealer(dealer.id);
+  assert.equal(room.dealer.type, "bot");
+});
