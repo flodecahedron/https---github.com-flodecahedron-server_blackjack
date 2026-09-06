@@ -38,9 +38,12 @@ const server = http.createServer((req, res) => { res.writeHead(req.url === "/hea
 const wss = new WebSocketServer({ server });
 wss.on("connection", ws => {
   let profile = null;
+  let messageType = "unknown";
   console.log("[socket] Client connected");
   ws.on("message", async raw => { try {
     const message = JSON.parse(raw); const { type } = message;
+    messageType = String(type ?? "unknown");
+    console.log(`[message] ${profile?.username ?? "anonymous"} → ${messageType}`);
     if (type === "register") {
       const username = String(message.username ?? "").trim();
       if (!/^[\w-]{3,16}$/.test(username)) throw Error("Pseudo: 3 à 16 caractères");
@@ -69,7 +72,10 @@ wss.on("connection", ws => {
     if (type === "bet") room.placeBet(profile.id, Number(message.amount));
     else if (type === "start") room.startIfReady(); else if (type === "hit") room.hit(profile.id); else if (type === "stand") room.stand(profile.id); else if (type === "dealer_hit") room.dealerHit(profile.id); else if (type === "dealer_stand") room.dealerStand(profile.id); else if (type === "double") room.double(profile.id); else if (type === "split") room.split(profile.id); else if (type === "surrender") room.surrender(profile.id); else if (type === "next_round") room.nextRound(); else if (type === "become_dealer") room.setDealer(profile.id); else if (type === "leave_dealer") room.removeDealer(profile.id); else throw Error("Unknown action");
     await saveRoomProfiles(room); broadcast(room);
-  } catch (error) { fail(ws, error.message); } });
+  } catch (error) {
+    console.warn(`[error] ${profile?.username ?? "anonymous"} → ${messageType}: ${error.message}`);
+    fail(ws, error.message);
+  } });
   ws.on("close", () => {
     // Do not remove a player when an older socket closes after a reconnect.
     if (!profile || sockets.get(profile.id) !== ws) return;
