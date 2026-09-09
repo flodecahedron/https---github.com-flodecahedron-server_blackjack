@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { WebSocketServer } from "ws";
 import { DAILY_ROULETTE_SEGMENTS, claimDailyRoulette, dailyReward, dailyRouletteStatus } from "./blackjack.js";
 import { GameRoom } from "./game-room.js";
+import { RouletteRoom } from "./roulette-room.js";
 import { PlayerStore } from "./player-store.js";
 
 const accounts = new Map(), rooms = new Map(), sockets = new Map(), store = new PlayerStore();
@@ -11,6 +12,7 @@ const id = () => crypto.randomUUID();
 const send = (ws, type, payload) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ type, ...payload }));
 const fail = (ws, message) => send(ws, "error", { message });
 const roomSummary = room => ({
+  game: room.game ?? "blackjack",
   code: room.code,
   name: room.name,
   phase: room.phase,
@@ -100,8 +102,14 @@ wss.on("connection", ws => {
       sendLeaderboard(ws);
       return;
     }
-    if (type === "create_room") { const code = roomCode(); const room = new GameRoom({ code, name: code, host: profile, onUpdate: updatedRoom => void saveRoomProfiles(updatedRoom).then(() => { broadcast(updatedRoom); broadcastRoomList(); }) }); rooms.set(room.code, room); console.log(`[room] ${profile.username} created table ${code}`); broadcast(room); broadcastRoomList(); return; }
-    if (type === "join_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); if (room.phase === "lobby") room.addPlayer(profile); else room.addSpectator(profile); await store.save(profile, accounts); console.log(`[room] ${profile.username} joined table ${room.code} as ${room.phase === "lobby" ? "player" : "spectator"}`); broadcast(room); broadcastRoomList(); return; }
+    if (type === "create_room") {
+      const code = roomCode();
+      const game = String(message.game ?? "blackjack");
+      const RoomClass = game === "roulette" ? RouletteRoom : GameRoom;
+      const room = new RoomClass({ code, name: code, host: profile, onUpdate: updatedRoom => void saveRoomProfiles(updatedRoom).then(() => { broadcast(updatedRoom); broadcastRoomList(); }) });
+      rooms.set(room.code, room); console.log(`[room] ${profile.username} created ${room.game} table ${code}`); broadcast(room); broadcastRoomList(); return;
+    }
+    if (type === "join_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); const seatsOpen = room.game === "roulette" ? room.phase === "betting" : room.phase === "lobby"; if (seatsOpen) room.addPlayer(profile); else room.addSpectator(profile); await store.save(profile, accounts); console.log(`[room] ${profile.username} joined ${room.game} table ${room.code} as ${seatsOpen ? "player" : "spectator"}`); broadcast(room); broadcastRoomList(); return; }
     if (type === "spectate_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); const currentRoom = [...rooms.values()].find(candidate => candidate.players.has(profile.id) || candidate.spectators.has(profile.id)); if (currentRoom && currentRoom !== room) throw Error("Leave your current room first"); if (!currentRoom) room.addSpectator(profile); await store.save(profile, accounts); console.log(`[room] ${profile.username} joined table ${room.code} as spectator`); broadcast(room); broadcastRoomList(); return; }
     if (type === "resume_room") {
       const room = rooms.get(String(message.code ?? "").trim().toUpperCase());
@@ -109,7 +117,8 @@ wss.on("connection", ws => {
       try {
         if (!room.players.has(profile.id) && !room.spectators.has(profile.id)) {
           const requestedRole = String(message.role ?? "player");
-          if (room.phase === "lobby" && requestedRole !== "spectator") room.addPlayer(profile);
+          const seatsOpen = room.game === "roulette" ? room.phase === "betting" : room.phase === "lobby";
+          if (seatsOpen && requestedRole !== "spectator") room.addPlayer(profile);
           else room.addSpectator(profile);
         }
         await store.save(profile, accounts);
@@ -123,13 +132,20 @@ wss.on("connection", ws => {
     const room = [...rooms.values()].find(candidate => candidate.players.has(profile.id) || candidate.spectators.has(profile.id)); if (!room) throw Error("Join a room first");
     if (type === "leave_room") {
       await removeFromRoom(room, profile);
-      send(ws, "left_room", {});
+      send(ws, "left_room", { profile });
       return;
     }
     if (type === "take_seat") { room.addPlayer(profile); await store.save(profile, accounts); broadcast(room); return; }
     if (type === "become_spectator") { room.becomeSpectator(profile.id); await saveRoomProfiles(room); broadcast(room); return; }
     if (!room.players.has(profile.id)) throw Error("You are spectating this round");
-    if (type === "bet") room.placeBet(profile.id, Number(message.amount));
+    if (room.game === "roulette") {
+      if (type === "roulette_bet") room.placeBet(profile.id, message.bet, Number(message.amount));
+      else if (type === "roulette_clear_bets") room.clearBets(profile.id);
+      else if (type === "ready") room.readyPlayer(profile.id);
+      else if (type === "unready") room.unreadyPlayer(profile.id);
+      else throw Error("Unknown roulette action");
+    }
+    else if (type === "bet") room.placeBet(profile.id, Number(message.amount));
     else if (type === "ready") room.readyPlayer(profile.id);
     else if (type === "unready") room.unreadyPlayer(profile.id);
     else if (type === "start") room.startIfReady(); else if (type === "hit") room.hit(profile.id); else if (type === "stand") room.stand(profile.id); else if (type === "dealer_hit") room.dealerHit(profile.id); else if (type === "dealer_stand") room.dealerStand(profile.id); else if (type === "double") room.double(profile.id); else if (type === "split") room.split(profile.id); else if (type === "surrender") room.surrender(profile.id); else if (type === "next_round") room.nextRound(); else if (type === "become_dealer") room.setDealer(profile.id); else if (type === "leave_dealer") room.removeDealer(profile.id); else throw Error("Unknown action");

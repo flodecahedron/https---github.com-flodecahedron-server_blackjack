@@ -1,6 +1,6 @@
-# Blackjack server
+# Serveur Casino Royale
 
-Serveur WebSocket autoritaire. Les cartes, mises, actions, soldes et gains ne sont jamais calculés par le client.
+Serveur WebSocket autoritaire pour le blackjack et la roulette américaine multijoueur. Les cartes, tirages, mises, actions, soldes et gains ne sont jamais calculés par le client.
 
 Déploiement Render : créez un **Web Service**, root directory `server`, build command `npm install`, start command `npm start`. Configurez `PORT` automatiquement (Render le fournit).
 

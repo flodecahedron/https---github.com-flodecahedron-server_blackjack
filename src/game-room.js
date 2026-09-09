@@ -9,6 +9,7 @@ function randomDeckColor(previousColor = null) {
 
 export class GameRoom {
   constructor({ code, name, host, onUpdate = null }) {
+    this.game = "blackjack";
     this.code = code; this.name = name; this.hostId = host.id;
     this.players = new Map([[host.id, { profile: host, hands: [], ready: false }]]);
     this.spectators = new Map(); this.onUpdate = onUpdate;
@@ -24,7 +25,7 @@ export class GameRoom {
   publicState(viewerId) {
     const revealDealer = ["dealer_turn", "settlement", "lobby"].includes(this.phase);
     const requiredPlayers = [...this.players.values()].filter(player => player.profile.id !== this.dealer.playerId);
-    return { code: this.code, name: this.name, phase: this.phase, currentPlayerId: this.current?.playerId ?? null, currentHandIndex: this.current?.handIndex ?? -1, readyCount: requiredPlayers.filter(player => player.ready).length, requiredCount: requiredPlayers.length, hasCompletedRound: this.hasCompletedRound, events: this.roundEvents, timerEndsAt: this.timerEndsAt ?? null, viewerRole: this.players.has(viewerId) ? "player" : "spectator", spectators: [...this.spectators.values()].map(profile => profile.username), deck: { color: this.deckColor, shuffleSerial: this.shuffleSerial },
+    return { game: this.game, code: this.code, name: this.name, phase: this.phase, currentPlayerId: this.current?.playerId ?? null, currentHandIndex: this.current?.handIndex ?? -1, readyCount: requiredPlayers.filter(player => player.ready).length, requiredCount: requiredPlayers.length, hasCompletedRound: this.hasCompletedRound, events: this.roundEvents, timerEndsAt: this.timerEndsAt ?? null, viewerRole: this.players.has(viewerId) ? "player" : "spectator", spectators: [...this.spectators.values()].map(profile => profile.username), deck: { color: this.deckColor, shuffleSerial: this.shuffleSerial },
       dealer: { ...this.dealer, canLeaveRole: this.phase === "lobby" && this.dealer.type === "player" && this.dealer.hasCompletedRound, cards: revealDealer ? this.dealer.cards : this.dealer.cards.map((card, i) => i ? { hidden: true } : card), value: revealDealer ? handValue(this.dealer.cards).total : null, scores: revealDealer ? handScores(this.dealer.cards) : [] },
       players: [...this.players.entries()].map(([id, player]) => ({ id, name: player.profile.username, balance: player.profile.balance, ready: player.ready, result: this.roundResults.get(id) ?? null,
         hands: player.hands.map((hand) => ({ ...hand, value: handValue(hand.cards).total, scores: handScores(hand.cards), blackjack: isBlackjack(hand),
