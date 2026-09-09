@@ -94,6 +94,16 @@ export class GameRoom {
     if (!player || !player.ready) throw Error("Player is not ready");
     player.ready = false;
   }
+  stopTurnTimer() {
+    if (this.turnTimer) clearTimeout(this.turnTimer);
+    this.turnTimer = null;
+  }
+  clearRoundTimers() {
+    if (this.betTimer) clearTimeout(this.betTimer);
+    if (this.turnTimer) clearTimeout(this.turnTimer);
+    if (this.dealerTimer) clearTimeout(this.dealerTimer);
+    this.betTimer = null; this.turnTimer = null; this.dealerTimer = null; this.timerEndsAt = null;
+  }
   startBetTimer() {
     const required = [...this.players.values()].filter(p => p.profile.id !== this.dealer.playerId);
     if (required.length <= 1 || this.betTimer) return;
@@ -140,15 +150,18 @@ export class GameRoom {
   surrender(id) { const hand = this.assertTurn(id); if (hand.cards.length !== 2 || hand.fromSplit) throw Error("Surrender is only available on the initial hand"); hand.status = "surrendered"; this.advance(); }
   advance() {
     const entries = [...this.players.entries()].filter(([,p]) => p.ready);
-    let pos = entries.findIndex(([id]) => id === this.current.playerId), handIndex = this.current.handIndex + 1;
+    let pos = this.current ? entries.findIndex(([id]) => id === this.current.playerId) : 0;
+    let handIndex = this.current ? this.current.handIndex + 1 : 0;
+    if (pos < 0) { pos = 0; handIndex = 0; }
     while (pos < entries.length) { const [id, p] = entries[pos]; while (handIndex < p.hands.length) if (p.hands[handIndex].status === "playing") { this.current = { playerId: id, handIndex }; this.startTurnTimer(id, handIndex); return; } else handIndex++; pos++; handIndex = 0; }
+    this.stopTurnTimer();
     this.phase = "dealer_wait";
     this.current = null;
     this.timerEndsAt = Date.now() + 2_000;
     this.dealerTimer = this.schedule(() => { this.dealerTimer = null; this.timerEndsAt = null; this.dealerTurn(); this.notify(); }, 2_000);
   }
   startTurnTimer(playerId, handIndex) {
-    if (this.turnTimer) clearTimeout(this.turnTimer);
+    this.stopTurnTimer();
     this.timerEndsAt = Date.now() + 30_000;
     this.turnTimer = this.schedule(() => {
       this.turnTimer = null;
@@ -161,9 +174,20 @@ export class GameRoom {
       this.notify();
     }, 30_000);
   }
+  startDealerTurnTimer(playerId) {
+    this.stopTurnTimer();
+    this.timerEndsAt = Date.now() + 30_000;
+    this.turnTimer = this.schedule(() => {
+      this.turnTimer = null;
+      this.timerEndsAt = null;
+      if (this.phase !== "dealer_turn" || this.dealer.type !== "player" || this.dealer.playerId !== playerId) return;
+      this.dealerStand(playerId);
+      this.notify();
+    }, 30_000);
+  }
   dealerTurn() {
     this.phase = "dealer_turn";
-    if (this.dealer.type === "player") { this.current = { playerId: this.dealer.playerId, dealer: true }; return; }
+    if (this.dealer.type === "player") { this.current = { playerId: this.dealer.playerId, dealer: true }; this.startDealerTurnTimer(this.dealer.playerId); return; }
     this.playBotDealerCard();
   }
   playBotDealerCard() {
@@ -180,10 +204,11 @@ export class GameRoom {
     if (handValue(this.dealer.cards).total >= 21) {
       this.recordDealerTerminalEvent();
       this.settle();
-    }
+    } else this.startDealerTurnTimer(id);
   }
   dealerStand(id) {
     if (this.phase !== "dealer_turn" || this.dealer.playerId !== id) throw Error("Not the dealer turn");
+    this.stopTurnTimer();
     this.settle();
   }
   dealerProfile() { return this.dealer.type === "player" ? this.player(this.dealer.playerId).profile : null; }
@@ -205,18 +230,14 @@ export class GameRoom {
     const isHumanDealer = this.dealer.type === "player" && this.dealer.playerId === id;
     if (this.phase === "lobby") {
       if (isHumanDealer) {
-        for (const [playerId, player] of this.players) if (playerId !== id && player.ready) {
+        for (const [playerId, player] of this.players) if (playerId !== id) {
           const refund = this.playerTotalBet(player);
           player.profile.balance += refund;
           leaving.profile.balance -= refund;
           player.hands = [];
           player.ready = false;
         }
-      } else if (leaving.ready) {
-        const refund = this.playerTotalBet(leaving);
-        leaving.profile.balance += refund;
-        if (this.dealer.type === "player") this.dealerProfile().balance -= refund;
-      }
+      } else this.refundLobbyBet(leaving);
     }
     if (isHumanDealer && !["lobby", "settlement"].includes(this.phase)) {
       for (const [playerId, player] of this.players) if (playerId !== id && player.ready) {
@@ -231,17 +252,19 @@ export class GameRoom {
       }
       this.phase = "settlement";
       this.current = null;
+      this.clearRoundTimers();
     }
     const wasCurrent = this.current?.playerId === id;
     this.removePlayer(id);
     if (isHumanDealer) this.dealer = { type: "bot", name: "Casino", bankroll: Infinity, cards: [] };
     if (wasCurrent && this.phase === "player_turn") {
-      this.current = { playerId: id, handIndex: -1 };
+      this.current = null;
       this.advance();
     }
     return true;
   }
   settle() {
+    this.clearRoundTimers();
     const dealerValue = handValue(this.dealer.cards).total, dealerBJ = isBlackjack(this.dealer);
     for (const [playerId, p] of this.players) if (p.ready) {
       let net = 0, outcome = "push";

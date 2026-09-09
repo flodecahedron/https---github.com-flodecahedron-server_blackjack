@@ -41,19 +41,24 @@ export function createShoe(decks = 6) {
   return cards;
 }
 
-export function fibonacci(index) {
-  let a = 0, b = 1;
-  for (let i = 0; i < index; i++) [a, b] = [b, a + b];
-  return a;
+export const DAILY_REWARD_AMOUNTS = Object.freeze([50, 75, 100, 150, 225, 350, 500]);
+
+function utcDateKey(date) {
+  return date.toISOString().slice(0, 10);
 }
 
 export function dailyReward(profile, now = new Date()) {
-  const today = now.toISOString().slice(0, 10);
-  if (profile.lastLogin === today) return 0;
-  const yesterday = new Date(now.getTime() - 86400000).toISOString().slice(0, 10);
-  profile.loginStreak = profile.lastLogin === yesterday ? profile.loginStreak + 1 : 1;
+  const today = utcDateKey(now);
+  const yesterday = utcDateKey(new Date(now.getTime() - 86400000));
+  const previousLogin = profile.lastLogin ? String(profile.lastLogin).slice(0, 10) : null;
+  const previousStreak = Number.isSafeInteger(profile.loginStreak) && profile.loginStreak > 0 ? profile.loginStreak : 0;
+  if (previousLogin === today) {
+    const streak = Math.max(1, previousStreak);
+    return { amount: 0, streak, claimedToday: true, claimedOn: today, nextAmount: DAILY_REWARD_AMOUNTS[Math.min(streak, DAILY_REWARD_AMOUNTS.length - 1)] };
+  }
+  profile.loginStreak = previousLogin === yesterday ? previousStreak + 1 : 1;
   profile.lastLogin = today;
-  const reward = fibonacci(profile.loginStreak - 1);
-  profile.balance += reward;
-  return reward;
+  const amount = DAILY_REWARD_AMOUNTS[Math.min(profile.loginStreak - 1, DAILY_REWARD_AMOUNTS.length - 1)];
+  profile.balance += amount;
+  return { amount, streak: profile.loginStreak, claimedToday: false, claimedOn: today, nextAmount: DAILY_REWARD_AMOUNTS[Math.min(profile.loginStreak, DAILY_REWARD_AMOUNTS.length - 1)] };
 }

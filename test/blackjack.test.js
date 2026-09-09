@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canSplit, fibonacci, handValue, isBlackjack } from "../src/blackjack.js";
+import { canSplit, dailyReward, handValue, isBlackjack } from "../src/blackjack.js";
 import { GameRoom } from "../src/game-room.js";
 
 const card = (rank) => ({ rank, suit: "spades" });
@@ -19,10 +19,6 @@ test("split requires matching ranks and available matching stake", () => {
   assert.equal(canSplit({ cards: [card("8"), card("8")], bet: 20 }, 20), true);
   assert.equal(canSplit({ cards: [card("10"), card("K")], bet: 20 }, 20), true);
   assert.equal(canSplit({ cards: [card("8"), card("9")], bet: 20 }, 20), false);
-});
-
-test("daily rewards follow Fibonacci", () => {
-  assert.deepEqual([0, 1, 2, 3, 4, 5, 6].map(fibonacci), [0, 1, 1, 2, 3, 5, 8]);
 });
 
 test("first player receives a turn after the initial deal", () => {
@@ -126,6 +122,24 @@ test("leaving human dealer pays every active player as a winner", () => {
   assert.deepEqual(room.roundResults.get(player.id).hands, [{ outcome: "win", net: 10 }]);
 });
 
+test("daily gift is awarded once per UTC day and tracks the streak", () => {
+  const profile = { balance: 1000, loginStreak: 0, lastLogin: null };
+  const first = dailyReward(profile, new Date("2026-09-01T12:00:00Z"));
+  const duplicate = dailyReward(profile, new Date("2026-09-01T22:00:00Z"));
+  const second = dailyReward(profile, new Date("2026-09-02T08:00:00Z"));
+  assert.deepEqual([first.amount, duplicate.amount, second.amount], [50, 0, 75]);
+  assert.equal(profile.balance, 1125);
+  assert.equal(profile.loginStreak, 2);
+  assert.equal(profile.lastLogin, "2026-09-02");
+});
+
+test("daily gift streak restarts after a missed day", () => {
+  const profile = { balance: 1000, loginStreak: 5, lastLogin: "2026-09-01" };
+  const gift = dailyReward(profile, new Date("2026-09-03T08:00:00Z"));
+  assert.equal(gift.amount, 50);
+  assert.equal(gift.streak, 1);
+});
+
 test("a player with no chips after settlement receives the casino safety grant", () => {
   const profile = { id: "player-1", username: "Test", balance: 1 };
   const room = new GameRoom({ code: "1234", name: "TEST", host: profile });
@@ -165,6 +179,7 @@ test("a human dealer becoming spectator returns the dealer role to the casino", 
   room.addPlayer(player);
   room.setDealer(dealer.id);
   room.placeBet(player.id, 20);
+  room.dealer.hasCompletedRound = true;
   room.becomeSpectator(dealer.id);
   assert.equal(room.dealer.type, "bot");
   assert.equal(dealer.balance, 1000);
@@ -214,4 +229,46 @@ test("a ready player can cancel readiness during betting", () => {
   room.readyPlayer(host.id);
   room.unreadyPlayer(host.id);
   assert.equal(room.player(host.id).ready, false);
+});
+
+test("leaving during the lobby refunds a bet even before ready", () => {
+  const profile = { id: "player-1", username: "Test", balance: 100 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: profile });
+  room.placeBet(profile.id, 25);
+  room.leavePlayer(profile.id);
+  assert.equal(profile.balance, 100);
+  assert.equal(room.players.has(profile.id), false);
+});
+
+test("the current player can leave without breaking turn progression", () => {
+  const first = { id: "first", username: "First", balance: 100 };
+  const second = { id: "second", username: "Second", balance: 100 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: first });
+  room.addPlayer(second);
+  room.placeBet(first.id, 10); room.placeBet(second.id, 10);
+  room.player(first.id).ready = true; room.player(second.id).ready = true;
+  room.player(first.id).hands[0].status = "playing";
+  room.player(second.id).hands[0].status = "playing";
+  room.phase = "player_turn"; room.current = { playerId: first.id, handIndex: 0 };
+  room.leavePlayer(first.id);
+  assert.equal(room.players.has(first.id), false);
+  assert.deepEqual(room.current, { playerId: second.id, handIndex: 0 });
+});
+
+test("a human dealer automatically stands when their timer expires", () => {
+  const dealer = { id: "dealer", username: "Dealer", balance: 1000 };
+  const player = { id: "player", username: "Player", balance: 100 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: dealer });
+  room.addPlayer(player); room.setDealer(dealer.id); room.placeBet(player.id, 10);
+  room.player(player.id).ready = true;
+  room.player(player.id).hands[0].cards = [card("10"), card("8")];
+  room.dealer.cards = [card("10"), card("7")];
+  let expireDealerTurn = null;
+  room.schedule = callback => { expireDealerTurn = callback; return null; };
+  room.dealerTurn();
+  assert.equal(room.phase, "dealer_turn");
+  assert.ok(room.timerEndsAt > Date.now());
+  expireDealerTurn();
+  assert.equal(room.phase, "settlement");
+  assert.equal(room.timerEndsAt, null);
 });

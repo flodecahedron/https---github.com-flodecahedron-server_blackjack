@@ -32,10 +32,22 @@ const saveRoomProfiles = room => Promise.all([
   ...room.spectators.values(),
 ].map(profile => store.save(profile, accounts)));
 const removeFromRoom = async (room, profile) => {
-  room.leavePlayer(profile.id);
-  await store.save(profile, accounts);
-  await saveRoomProfiles(room);
-  if (room.players.size || room.spectators.size) broadcast(room); else rooms.delete(room.code);
+  try {
+    room.leavePlayer(profile.id);
+  } catch (error) {
+    console.error(`[room] Forced removal of ${profile.username} from ${room.code}: ${error.message}`);
+    room.players.delete(profile.id); room.spectators.delete(profile.id);
+    if (room.dealer.type === "player" && room.dealer.playerId === profile.id) room.dealer = { type: "bot", name: "Casino", bankroll: Infinity, cards: [] };
+  }
+  try { await store.save(profile, accounts); } catch (error) { console.error(`[store] Could not save ${profile.username} after leaving: ${error.message}`); }
+  try { await saveRoomProfiles(room); } catch (error) { console.error(`[store] Could not save room ${room.code} after departure: ${error.message}`); }
+  if (room.players.size) broadcast(room);
+  else {
+    room.clearRoundTimers();
+    for (const spectatorId of room.spectators.keys()) if (sockets.has(spectatorId)) send(sockets.get(spectatorId), "left_room", {});
+    room.spectators.clear();
+    rooms.delete(room.code);
+  }
   broadcastRoomList();
 };
 const replaceActiveSocket = (profileId, ws) => {
@@ -62,15 +74,15 @@ wss.on("connection", ws => {
       if ([...accounts.values()].some(account => account.username.toLowerCase() === username.toLowerCase())) throw Error("Pseudo déjà utilisé");
       profile = { id: id(), username, avatar: String(message.avatar ?? ""), balance: 1000, loginStreak: 0, lastLogin: null };
       accounts.set(profile.id, profile); replaceActiveSocket(profile.id, ws);
-      const reward = dailyReward(profile); await store.save(profile, accounts);
+      const dailyGift = dailyReward(profile); await store.save(profile, accounts);
       console.log(`[player] ${profile.username} created an account and connected`);
-      send(ws, "authenticated", { profile, dailyReward: reward }); sendRoomList(ws); return;
+      send(ws, "authenticated", { profile, dailyReward: dailyGift.amount, dailyGift }); sendRoomList(ws); return;
     }
     if (type === "login") {
       profile = accounts.get(String(message.accountId)); if (!profile) throw Error("Compte introuvable");
-      replaceActiveSocket(profile.id, ws); const reward = dailyReward(profile); await store.save(profile, accounts);
+      replaceActiveSocket(profile.id, ws); const dailyGift = dailyReward(profile); await store.save(profile, accounts);
       console.log(`[player] ${profile.username} connected`);
-      send(ws, "authenticated", { profile, dailyReward: reward }); sendRoomList(ws); return;
+      send(ws, "authenticated", { profile, dailyReward: dailyGift.amount, dailyGift }); sendRoomList(ws); return;
     }
     if (!profile) throw Error("Authentication required");
     if (type === "list_rooms") { sendRoomList(ws); return; }
