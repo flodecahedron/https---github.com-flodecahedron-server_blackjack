@@ -42,8 +42,12 @@ export function createShoe(decks = 6) {
 }
 
 export const DAILY_REWARD_AMOUNTS = Object.freeze([50, 75, 100, 150, 225, 350, 500]);
+export const DAILY_ROULETTE_SEGMENTS = Object.freeze([
+  10, 100, 20, 50, 10, 500, 20, 10, 50, 20, 10, 1000,
+  10, 20, 50, 10, 100, 20, 10, 500, 50, 20, 10, 100,
+]);
 
-function utcDateKey(date) {
+export function utcDateKey(date) {
   return date.toISOString().slice(0, 10);
 }
 
@@ -61,4 +65,20 @@ export function dailyReward(profile, now = new Date()) {
   const amount = DAILY_REWARD_AMOUNTS[Math.min(profile.loginStreak - 1, DAILY_REWARD_AMOUNTS.length - 1)];
   profile.balance += amount;
   return { amount, streak: profile.loginStreak, claimedToday: false, claimedOn: today, nextAmount: DAILY_REWARD_AMOUNTS[Math.min(profile.loginStreak, DAILY_REWARD_AMOUNTS.length - 1)] };
+}
+
+export function dailyRouletteStatus(profile, now = new Date()) {
+  const today = utcDateKey(now);
+  const claimedOn = profile.lastRoulette ? String(profile.lastRoulette).slice(0, 10) : null;
+  return { available: claimedOn !== today, claimedOn, segments: [...DAILY_ROULETTE_SEGMENTS] };
+}
+
+export function claimDailyRoulette(profile, segmentIndex, now = new Date()) {
+  const status = dailyRouletteStatus(profile, now);
+  if (!status.available) throw Error("La roulette quotidienne a déjà été jouée aujourd'hui");
+  if (!Number.isInteger(segmentIndex) || segmentIndex < 0 || segmentIndex >= DAILY_ROULETTE_SEGMENTS.length) throw Error("Tirage de roulette invalide");
+  const amount = DAILY_ROULETTE_SEGMENTS[segmentIndex];
+  profile.balance += amount;
+  profile.lastRoulette = utcDateKey(now);
+  return { amount, segmentIndex, balance: profile.balance, roulette: dailyRouletteStatus(profile, now) };
 }

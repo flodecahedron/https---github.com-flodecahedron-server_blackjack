@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canSplit, dailyReward, handValue, isBlackjack } from "../src/blackjack.js";
+import { DAILY_ROULETTE_SEGMENTS, canSplit, claimDailyRoulette, dailyReward, dailyRouletteStatus, handValue, isBlackjack } from "../src/blackjack.js";
 import { GameRoom } from "../src/game-room.js";
 
 const card = (rank) => ({ rank, suit: "spades" });
@@ -138,6 +138,25 @@ test("daily gift streak restarts after a missed day", () => {
   const gift = dailyReward(profile, new Date("2026-09-03T08:00:00Z"));
   assert.equal(gift.amount, 50);
   assert.equal(gift.streak, 1);
+});
+
+test("daily roulette can be claimed only once per UTC day", () => {
+  const profile = { balance: 1000, lastRoulette: null };
+  const claimed = claimDailyRoulette(profile, 11, new Date("2026-09-01T12:00:00Z"));
+  assert.equal(claimed.amount, 1000);
+  assert.equal(profile.balance, 2000);
+  assert.equal(dailyRouletteStatus(profile, new Date("2026-09-01T22:00:00Z")).available, false);
+  assert.throws(() => claimDailyRoulette(profile, 0, new Date("2026-09-01T22:00:00Z")), /déjà été jouée/);
+  assert.equal(dailyRouletteStatus(profile, new Date("2026-09-02T00:00:00Z")).available, true);
+});
+
+test("daily roulette prize frequency decreases as values rise", () => {
+  const frequencies = new Map();
+  for (const amount of DAILY_ROULETTE_SEGMENTS) frequencies.set(amount, (frequencies.get(amount) ?? 0) + 1);
+  const orderedPrizes = [10, 20, 50, 100, 500, 1000];
+  for (let index = 1; index < orderedPrizes.length; index++) {
+    assert.ok(frequencies.get(orderedPrizes[index - 1]) > frequencies.get(orderedPrizes[index]));
+  }
 });
 
 test("a player with no chips after settlement receives the casino safety grant", () => {

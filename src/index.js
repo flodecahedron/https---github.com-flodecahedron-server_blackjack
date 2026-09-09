@@ -1,7 +1,7 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import { WebSocketServer } from "ws";
-import { dailyReward } from "./blackjack.js";
+import { DAILY_ROULETTE_SEGMENTS, claimDailyRoulette, dailyReward, dailyRouletteStatus } from "./blackjack.js";
 import { GameRoom } from "./game-room.js";
 import { PlayerStore } from "./player-store.js";
 
@@ -76,21 +76,29 @@ wss.on("connection", ws => {
       const username = String(message.username ?? "").trim();
       if (!/^[\w-]{3,16}$/.test(username)) throw Error("Pseudo: 3 à 16 caractères");
       if ([...accounts.values()].some(account => account.username.toLowerCase() === username.toLowerCase())) throw Error("Pseudo déjà utilisé");
-      profile = { id: id(), username, avatar: String(message.avatar ?? ""), balance: 1000, loginStreak: 0, lastLogin: null };
+      profile = { id: id(), username, avatar: String(message.avatar ?? ""), balance: 1000, loginStreak: 0, lastLogin: null, lastRoulette: null };
       accounts.set(profile.id, profile); replaceActiveSocket(profile.id, ws);
       const dailyGift = dailyReward(profile); await store.save(profile, accounts);
       console.log(`[player] ${profile.username} created an account and connected`);
-      send(ws, "authenticated", { profile, dailyReward: dailyGift.amount, dailyGift }); sendRoomList(ws); sendLeaderboard(ws); return;
+      send(ws, "authenticated", { profile, dailyReward: dailyGift.amount, dailyGift, dailyRoulette: dailyRouletteStatus(profile) }); sendRoomList(ws); sendLeaderboard(ws); return;
     }
     if (type === "login") {
       profile = accounts.get(String(message.accountId)); if (!profile) throw Error("Compte introuvable");
       replaceActiveSocket(profile.id, ws); const dailyGift = dailyReward(profile); await store.save(profile, accounts);
       console.log(`[player] ${profile.username} connected`);
-      send(ws, "authenticated", { profile, dailyReward: dailyGift.amount, dailyGift }); sendRoomList(ws); sendLeaderboard(ws); return;
+      send(ws, "authenticated", { profile, dailyReward: dailyGift.amount, dailyGift, dailyRoulette: dailyRouletteStatus(profile) }); sendRoomList(ws); sendLeaderboard(ws); return;
     }
     if (!profile) throw Error("Authentication required");
     if (type === "list_rooms") { sendRoomList(ws); return; }
     if (type === "get_leaderboard") { sendLeaderboard(ws); return; }
+    if (type === "get_daily_roulette") { send(ws, "daily_roulette_status", { roulette: dailyRouletteStatus(profile) }); return; }
+    if (type === "claim_daily_roulette") {
+      const rouletteResult = claimDailyRoulette(profile, crypto.randomInt(DAILY_ROULETTE_SEGMENTS.length));
+      await store.save(profile, accounts);
+      send(ws, "daily_roulette_result", rouletteResult);
+      sendLeaderboard(ws);
+      return;
+    }
     if (type === "create_room") { const code = roomCode(); const room = new GameRoom({ code, name: code, host: profile, onUpdate: updatedRoom => void saveRoomProfiles(updatedRoom).then(() => { broadcast(updatedRoom); broadcastRoomList(); }) }); rooms.set(room.code, room); console.log(`[room] ${profile.username} created table ${code}`); broadcast(room); broadcastRoomList(); return; }
     if (type === "join_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); if (room.phase === "lobby") room.addPlayer(profile); else room.addSpectator(profile); await store.save(profile, accounts); console.log(`[room] ${profile.username} joined table ${room.code} as ${room.phase === "lobby" ? "player" : "spectator"}`); broadcast(room); broadcastRoomList(); return; }
     if (type === "spectate_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); const currentRoom = [...rooms.values()].find(candidate => candidate.players.has(profile.id) || candidate.spectators.has(profile.id)); if (currentRoom && currentRoom !== room) throw Error("Leave your current room first"); if (!currentRoom) room.addSpectator(profile); await store.save(profile, accounts); console.log(`[room] ${profile.username} joined table ${room.code} as spectator`); broadcast(room); broadcastRoomList(); return; }
