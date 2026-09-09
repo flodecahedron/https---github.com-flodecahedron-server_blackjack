@@ -89,6 +89,7 @@ wss.on("connection", ws => {
       send(ws, "authenticated", { profile, dailyReward: dailyGift.amount, dailyGift, dailyRoulette: dailyRouletteStatus(profile) }); sendRoomList(ws); sendLeaderboard(ws); return;
     }
     if (!profile) throw Error("Authentication required");
+    if (type === "ping") { send(ws, "pong", {}); return; }
     if (type === "list_rooms") { sendRoomList(ws); return; }
     if (type === "get_leaderboard") { sendLeaderboard(ws); return; }
     if (type === "get_daily_roulette") { send(ws, "daily_roulette_status", { roulette: dailyRouletteStatus(profile) }); return; }
@@ -102,6 +103,23 @@ wss.on("connection", ws => {
     if (type === "create_room") { const code = roomCode(); const room = new GameRoom({ code, name: code, host: profile, onUpdate: updatedRoom => void saveRoomProfiles(updatedRoom).then(() => { broadcast(updatedRoom); broadcastRoomList(); }) }); rooms.set(room.code, room); console.log(`[room] ${profile.username} created table ${code}`); broadcast(room); broadcastRoomList(); return; }
     if (type === "join_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); if (room.phase === "lobby") room.addPlayer(profile); else room.addSpectator(profile); await store.save(profile, accounts); console.log(`[room] ${profile.username} joined table ${room.code} as ${room.phase === "lobby" ? "player" : "spectator"}`); broadcast(room); broadcastRoomList(); return; }
     if (type === "spectate_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); const currentRoom = [...rooms.values()].find(candidate => candidate.players.has(profile.id) || candidate.spectators.has(profile.id)); if (currentRoom && currentRoom !== room) throw Error("Leave your current room first"); if (!currentRoom) room.addSpectator(profile); await store.save(profile, accounts); console.log(`[room] ${profile.username} joined table ${room.code} as spectator`); broadcast(room); broadcastRoomList(); return; }
+    if (type === "resume_room") {
+      const room = rooms.get(String(message.code ?? "").trim().toUpperCase());
+      if (!room) { send(ws, "room_resume_failed", { message: "La table n'existe plus" }); return; }
+      try {
+        if (!room.players.has(profile.id) && !room.spectators.has(profile.id)) {
+          const requestedRole = String(message.role ?? "player");
+          if (room.phase === "lobby" && requestedRole !== "spectator") room.addPlayer(profile);
+          else room.addSpectator(profile);
+        }
+        await store.save(profile, accounts);
+        console.log(`[room] ${profile.username} resumed table ${room.code}`);
+        broadcast(room); broadcastRoomList();
+      } catch (error) {
+        send(ws, "room_resume_failed", { message: error.message });
+      }
+      return;
+    }
     const room = [...rooms.values()].find(candidate => candidate.players.has(profile.id) || candidate.spectators.has(profile.id)); if (!room) throw Error("Join a room first");
     if (type === "leave_room") {
       await removeFromRoom(room, profile);
