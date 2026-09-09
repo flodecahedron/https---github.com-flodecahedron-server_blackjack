@@ -160,6 +160,20 @@ test("a player is restored to 100 chips when joining a room with no balance", ()
   assert.equal(brokePlayer.balance, 100);
 });
 
+test("the shoe and card-back color change after every third completed round", () => {
+  const profile = { id: "player-1", username: "Test", balance: 1000 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: profile });
+  const previousColor = room.deckColor;
+  const previousSerial = room.shuffleSerial;
+  room.roundsSinceShuffle = 3;
+  room.phase = "settlement";
+  room.nextRound();
+  assert.equal(room.shuffleSerial, previousSerial + 1);
+  assert.notEqual(room.deckColor, previousColor);
+  assert.equal(room.shoe.length, 312);
+  assert.deepEqual(room.publicState(profile.id).deck, { color: room.deckColor, shuffleSerial: room.shuffleSerial });
+});
+
 test("spectating during betting refunds the player's stake", () => {
   const host = { id: "host", username: "Host", balance: 1000 };
   const player = { id: "player", username: "Player", balance: 100 };

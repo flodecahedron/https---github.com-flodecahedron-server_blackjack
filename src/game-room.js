@@ -1,12 +1,20 @@
 import { canSplit, createShoe, handScores, handValue, isBlackjack } from "./blackjack.js";
 
+const DECK_COLORS = Object.freeze(["black", "blue", "green", "orange", "purple", "red"]);
+
+function randomDeckColor(previousColor = null) {
+  const available = previousColor ? DECK_COLORS.filter(color => color !== previousColor) : DECK_COLORS;
+  return available[Math.floor(Math.random() * available.length)];
+}
+
 export class GameRoom {
   constructor({ code, name, host, onUpdate = null }) {
     this.code = code; this.name = name; this.hostId = host.id;
     this.players = new Map([[host.id, { profile: host, hands: [], ready: false }]]);
     this.spectators = new Map(); this.onUpdate = onUpdate;
     this.dealer = { type: "bot", name: "Casino", bankroll: Infinity, cards: [] };
-    this.shoe = createShoe(); this.phase = "lobby"; this.current = null; this.roundResults = new Map();
+    this.shoe = createShoe(); this.deckColor = randomDeckColor(); this.shuffleSerial = 0; this.roundsSinceShuffle = 0;
+    this.phase = "lobby"; this.current = null; this.roundResults = new Map();
     this.roundEvents = []; this.nextEventId = 1; this.hasCompletedRound = false;
     this.betTimer = null; this.turnTimer = null; this.dealerTimer = null;
   }
@@ -16,7 +24,7 @@ export class GameRoom {
   publicState(viewerId) {
     const revealDealer = ["dealer_turn", "settlement", "lobby"].includes(this.phase);
     const requiredPlayers = [...this.players.values()].filter(player => player.profile.id !== this.dealer.playerId);
-    return { code: this.code, name: this.name, phase: this.phase, currentPlayerId: this.current?.playerId ?? null, currentHandIndex: this.current?.handIndex ?? -1, readyCount: requiredPlayers.filter(player => player.ready).length, requiredCount: requiredPlayers.length, hasCompletedRound: this.hasCompletedRound, events: this.roundEvents, timerEndsAt: this.timerEndsAt ?? null, viewerRole: this.players.has(viewerId) ? "player" : "spectator", spectators: [...this.spectators.values()].map(profile => profile.username),
+    return { code: this.code, name: this.name, phase: this.phase, currentPlayerId: this.current?.playerId ?? null, currentHandIndex: this.current?.handIndex ?? -1, readyCount: requiredPlayers.filter(player => player.ready).length, requiredCount: requiredPlayers.length, hasCompletedRound: this.hasCompletedRound, events: this.roundEvents, timerEndsAt: this.timerEndsAt ?? null, viewerRole: this.players.has(viewerId) ? "player" : "spectator", spectators: [...this.spectators.values()].map(profile => profile.username), deck: { color: this.deckColor, shuffleSerial: this.shuffleSerial },
       dealer: { ...this.dealer, canLeaveRole: this.phase === "lobby" && this.dealer.type === "player" && this.dealer.hasCompletedRound, cards: revealDealer ? this.dealer.cards : this.dealer.cards.map((card, i) => i ? { hidden: true } : card), value: revealDealer ? handValue(this.dealer.cards).total : null, scores: revealDealer ? handScores(this.dealer.cards) : [] },
       players: [...this.players.entries()].map(([id, player]) => ({ id, name: player.profile.username, balance: player.profile.balance, ready: player.ready, result: this.roundResults.get(id) ?? null,
         hands: player.hands.map((hand) => ({ ...hand, value: handValue(hand.cards).total, scores: handScores(hand.cards), blackjack: isBlackjack(hand),
@@ -129,7 +137,6 @@ export class GameRoom {
     const active = required.filter(p => p.ready);
     if (!required.length || !required.every(p => p.ready && p.hands.length && p.hands[0].bet > 0)) throw Error("Waiting for every player to validate a bet");
     if (this.betTimer) { clearTimeout(this.betTimer); this.betTimer = null; this.timerEndsAt = null; }
-    if (this.shoe.length < 52) this.shoe = createShoe();
     this.dealer.cards = []; this.roundResults.clear(); this.roundEvents = [];
     for (let i = 0; i < 2; i++) { for (const p of active) p.hands[0].cards.push(this.draw()); this.dealer.cards.push(this.draw()); }
     for (const player of active) if (isBlackjack(player.hands[0])) {
@@ -141,7 +148,17 @@ export class GameRoom {
     this.phase = "player_turn"; this.current = { playerId: [...this.players.entries()].find(([,p]) => p.ready)?.[0], handIndex: -1 };
     this.advance(); return true;
   }
-  draw() { return this.shoe.pop(); }
+  draw() {
+    if (!this.shoe.length) this.shuffleDeck();
+    return this.shoe.pop();
+  }
+
+  shuffleDeck() {
+    this.shoe = createShoe();
+    this.deckColor = randomDeckColor(this.deckColor);
+    this.shuffleSerial += 1;
+    this.roundsSinceShuffle = 0;
+  }
   assertTurn(id) { if (this.phase !== "player_turn" || this.current.playerId !== id) throw Error("Not your turn"); return this.player(id).hands[this.current.handIndex]; }
   hit(id) { const hand = this.assertTurn(id); hand.cards.push(this.draw()); this.recordTerminalHandEvent(id, hand); if (handValue(hand.cards).total >= 21) { hand.status = "stood"; this.advance(); } }
   stand(id) { const hand = this.assertTurn(id); hand.status = "stood"; this.advance(); }
@@ -251,6 +268,7 @@ export class GameRoom {
         player.ready = false;
       }
       this.phase = "settlement";
+      this.roundsSinceShuffle += 1;
       this.current = null;
       this.clearRoundTimers();
     }
@@ -290,7 +308,13 @@ export class GameRoom {
       p.ready = false;
     }
     if (this.dealer.type === "player") this.dealer.hasCompletedRound = true;
+    this.roundsSinceShuffle += 1;
     this.phase = "settlement"; this.current = null;
   }
-  nextRound() { if (this.phase !== "settlement") throw Error("Round not complete"); this.phase = "lobby"; this.hasCompletedRound = true; this.dealer.cards = []; this.roundResults.clear(); this.roundEvents = []; for (const [,p] of this.players) p.hands = []; }
+  nextRound() {
+    if (this.phase !== "settlement") throw Error("Round not complete");
+    if (this.roundsSinceShuffle >= 3) this.shuffleDeck();
+    this.phase = "lobby"; this.hasCompletedRound = true; this.dealer.cards = []; this.roundResults.clear(); this.roundEvents = [];
+    for (const [,p] of this.players) p.hands = [];
+  }
 }
