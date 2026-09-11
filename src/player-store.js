@@ -6,12 +6,16 @@ export class PlayerStore {
   constructor() {
     this.filePath = process.env.PLAYER_DATA_PATH || join(process.cwd(), "data", "players.json");
     this.pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_URL.includes("render.com") ? { rejectUnauthorized: false } : undefined }) : null;
+    this.localAbuseEvents = [];
   }
   async initialize() {
     if (this.pool) {
       await this.pool.query("CREATE TABLE IF NOT EXISTS blackjack_players (id UUID PRIMARY KEY, username VARCHAR(16) UNIQUE NOT NULL, avatar TEXT NOT NULL DEFAULT '', balance INTEGER NOT NULL, login_streak INTEGER NOT NULL DEFAULT 0, last_login DATE, last_roulette DATE)");
       await this.pool.query("ALTER TABLE blackjack_players ALTER COLUMN balance TYPE INTEGER USING CEIL(balance)::INTEGER");
       await this.pool.query("ALTER TABLE blackjack_players ADD COLUMN IF NOT EXISTS last_roulette DATE");
+      await this.pool.query("CREATE TABLE IF NOT EXISTS blackjack_abuse_events (id BIGSERIAL PRIMARY KEY, subject_hash CHAR(64) NOT NULL, action VARCHAR(48) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
+      await this.pool.query("CREATE INDEX IF NOT EXISTS blackjack_abuse_events_lookup ON blackjack_abuse_events (subject_hash, action, created_at)");
+      await this.pool.query("DELETE FROM blackjack_abuse_events WHERE created_at < NOW() - INTERVAL '8 days'");
       return;
     }
     await mkdir(dirname(this.filePath), { recursive: true });
@@ -31,5 +35,46 @@ export class PlayerStore {
     const temporary = `${this.filePath}.tmp`;
     await writeFile(temporary, JSON.stringify([...accounts.values()], null, 2));
     await rename(temporary, this.filePath);
+  }
+
+  /**
+   * Atomically consumes one persistent quota unit. PostgreSQL advisory locking
+   * prevents parallel sockets from passing the limit at the same time.
+   */
+  async consumeQuota(subjectHash, action, limit, windowMilliseconds) {
+    const cutoff = new Date(Date.now() - windowMilliseconds);
+    if (this.pool) {
+      const client = await this.pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`${subjectHash}:${action}`]);
+        const { rows } = await client.query(
+          "SELECT COUNT(*)::INTEGER AS count FROM blackjack_abuse_events WHERE subject_hash=$1 AND action=$2 AND created_at >= $3",
+          [subjectHash, action, cutoff],
+        );
+        if (rows[0].count >= limit) {
+          await client.query("ROLLBACK");
+          return false;
+        }
+        await client.query(
+          "INSERT INTO blackjack_abuse_events (subject_hash, action) VALUES ($1, $2)",
+          [subjectHash, action],
+        );
+        await client.query("COMMIT");
+        return true;
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+
+    const now = Date.now();
+    this.localAbuseEvents = this.localAbuseEvents.filter(event => event.createdAt >= cutoff.getTime());
+    const count = this.localAbuseEvents.filter(event => event.subjectHash === subjectHash && event.action === action).length;
+    if (count >= limit) return false;
+    this.localAbuseEvents.push({ subjectHash, action, createdAt: now });
+    return true;
   }
 }

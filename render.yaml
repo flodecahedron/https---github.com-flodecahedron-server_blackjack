@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: casino-royale-server
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: casino-royale-postgres
+          property: connectionString
+      - key: ABUSE_HASH_SECRET
+        generateValue: true
+      - key: REGISTRATION_IP_LIMIT
+        value: "3"
+      - key: DAILY_ROULETTE_IP_LIMIT
+        value: "3"
+      - key: MAX_CONNECTIONS_PER_IP
+        value: "5"
+      - key: MESSAGE_LIMIT_PER_10S
+        value: "40"
+      - key: STATE_ACTION_LIMIT_PER_10S
+        value: "15"
+
+databases:
+  - name: casino-royale-postgres
+    plan: free
+    region: frankfurt
+    databaseName: casino_royale
+    user: casino_royale
+    ipAllowList: []

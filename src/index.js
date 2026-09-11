@@ -5,8 +5,25 @@ import { DAILY_ROULETTE_SEGMENTS, claimDailyRoulette, dailyReward, dailyRoulette
 import { GameRoom } from "./game-room.js";
 import { RouletteRoom } from "./roulette-room.js";
 import { PlayerStore } from "./player-store.js";
+import { FixedWindowRateLimiter, fingerprintAddress, getClientAddress, readIntegerSetting } from "./security.js";
 
 const accounts = new Map(), rooms = new Map(), sockets = new Map(), store = new PlayerStore();
+const abuseHashSecret = String(process.env.ABUSE_HASH_SECRET ?? "").trim();
+if (process.env.DATABASE_URL && !abuseHashSecret) throw Error("ABUSE_HASH_SECRET is required when DATABASE_URL is configured");
+const addressHashSecret = abuseHashSecret || crypto.randomBytes(32).toString("hex");
+const registrationIpLimit = readIntegerSetting("REGISTRATION_IP_LIMIT", 3, 1, 100);
+const dailyRouletteIpLimit = readIntegerSetting("DAILY_ROULETTE_IP_LIMIT", 3, 1, 100);
+const maxConnectionsPerIp = readIntegerSetting("MAX_CONNECTIONS_PER_IP", 5, 1, 100);
+const messageLimitPerTenSeconds = readIntegerSetting("MESSAGE_LIMIT_PER_10S", 40, 10, 500);
+const stateActionLimitPerTenSeconds = readIntegerSetting("STATE_ACTION_LIMIT_PER_10S", 15, 5, 100);
+const connectionCounts = new Map();
+const trafficLimiter = new FixedWindowRateLimiter();
+const persistentQuotaWindow = 24 * 60 * 60 * 1000;
+const STATE_CHANGING_ACTIONS = new Set([
+  "create_room", "join_room", "spectate_room", "resume_room", "leave_room", "take_seat", "become_spectator",
+  "roulette_bet", "roulette_clear_bets", "ready", "unready", "bet", "start", "hit", "stand", "dealer_hit",
+  "dealer_stand", "double", "split", "surrender", "next_round", "become_dealer", "leave_dealer",
+]);
 const ROOM_CODES = ["ABLE", "BAKE", "BIRD", "BLUE", "BOLD", "CALM", "DARK", "DOVE", "EAST", "FIRE", "GOLD", "HILL", "JUMP", "LIME", "MOON", "ROSE", "SAND", "STAR", "WAVE", "WIND"];
 const id = () => crypto.randomUUID();
 const send = (ws, type, payload) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ type, ...payload }));
@@ -33,6 +50,7 @@ const roomCode = () => {
   return available[crypto.randomInt(available.length)];
 };
 const broadcast = room => { for (const playerId of [...room.players.keys(), ...room.spectators.keys()]) if (sockets.has(playerId)) send(sockets.get(playerId), "room_state", { room: room.publicState(playerId) }); };
+const currentRoomFor = profileId => [...rooms.values()].find(room => room.players.has(profileId) || room.spectators.has(profileId));
 const saveRoomProfiles = room => Promise.all([
   ...[...room.players.values()].map(player => player.profile),
   ...room.spectators.values(),
@@ -64,20 +82,68 @@ const replaceActiveSocket = (profileId, ws) => {
   if (previous && previous !== ws) previous.close(4001, "Session replaced");
 };
 
+const roomUpdateHandler = () => {
+  let lastPublishedPhase = null;
+  return updatedRoom => {
+    const phaseChanged = updatedRoom.phase !== lastPublishedPhase;
+    lastPublishedPhase = updatedRoom.phase;
+    void saveRoomProfiles(updatedRoom)
+      .then(() => {
+        broadcast(updatedRoom);
+        if (phaseChanged) broadcastRoomList();
+      })
+      .catch(error => console.error(`[store] Could not save room ${updatedRoom.code}: ${error.message}`));
+  };
+};
+
 const server = http.createServer((req, res) => { res.writeHead(req.url === "/health" ? 200 : 404, { "content-type": "application/json" }); res.end(JSON.stringify({ status: "ok", persistence: process.env.DATABASE_URL ? "postgres" : "file" })); });
-const wss = new WebSocketServer({ server });
-wss.on("connection", ws => {
+const wss = new WebSocketServer({ server, maxPayload: 16 * 1024, perMessageDeflate: false });
+wss.on("connection", (ws, request) => {
+  const clientAddress = getClientAddress(request);
+  const addressFingerprint = fingerprintAddress(clientAddress, addressHashSecret);
+  const openConnections = connectionCounts.get(addressFingerprint) ?? 0;
+  if (openConnections >= maxConnectionsPerIp) {
+    console.warn(`[security] Connection refused for ${addressFingerprint.slice(0, 12)}: concurrent connection limit`);
+    fail(ws, "Trop de connexions simultanées depuis ce réseau");
+    ws.close(1008, "Connection limit");
+    return;
+  }
+  connectionCounts.set(addressFingerprint, openConnections + 1);
   let profile = null;
   let messageType = "unknown";
-  console.log("[socket] Client connected");
+  let connectionReleased = false;
+  console.log(`[socket] Client connected (${addressFingerprint.slice(0, 12)})`);
   ws.on("message", async raw => { try {
-    const message = JSON.parse(raw); const { type } = message;
+    const ipTrafficKey = `ip:${addressFingerprint}`;
+    if (!trafficLimiter.allow(ipTrafficKey, messageLimitPerTenSeconds, 10_000)) {
+      console.warn(`[security] Traffic limit reached for ${addressFingerprint.slice(0, 12)}`);
+      fail(ws, "Trop de requêtes. Reconnexion nécessaire.");
+      ws.close(1008, "Rate limit");
+      return;
+    }
+    if (profile && !trafficLimiter.allow(`account:${profile.id}`, messageLimitPerTenSeconds, 10_000)) {
+      console.warn(`[security] Traffic limit reached for account ${profile.id}`);
+      fail(ws, "Trop de requêtes. Reconnexion nécessaire.");
+      ws.close(1008, "Rate limit");
+      return;
+    }
+    const message = JSON.parse(raw.toString()); const { type } = message;
     messageType = String(type ?? "unknown");
     console.log(`[message] ${profile?.username ?? "anonymous"} → ${messageType}`);
+    if (profile && STATE_CHANGING_ACTIONS.has(type) && !trafficLimiter.allow(`action:${profile.id}`, stateActionLimitPerTenSeconds, 10_000)) {
+      console.warn(`[security] Action limit reached for account ${profile.id}`);
+      fail(ws, "Trop d'actions envoyées. Reconnexion nécessaire.");
+      ws.close(1008, "Action rate limit");
+      return;
+    }
     if (type === "register") {
       const username = String(message.username ?? "").trim();
       if (!/^[\w-]{3,16}$/.test(username)) throw Error("Pseudo: 3 à 16 caractères");
       if ([...accounts.values()].some(account => account.username.toLowerCase() === username.toLowerCase())) throw Error("Pseudo déjà utilisé");
+      if (!await store.consumeQuota(addressFingerprint, "register", registrationIpLimit, persistentQuotaWindow)) {
+        console.warn(`[security] Registration quota reached for ${addressFingerprint.slice(0, 12)}`);
+        throw Error("Trop de comptes ont été créés depuis ce réseau aujourd'hui");
+      }
       profile = { id: id(), username, avatar: String(message.avatar ?? ""), balance: 1000, loginStreak: 0, lastLogin: null, lastRoulette: null };
       accounts.set(profile.id, profile); replaceActiveSocket(profile.id, ws);
       const dailyGift = dailyReward(profile); await store.save(profile, accounts);
@@ -96,6 +162,11 @@ wss.on("connection", ws => {
     if (type === "get_leaderboard") { sendLeaderboard(ws); return; }
     if (type === "get_daily_roulette") { send(ws, "daily_roulette_status", { roulette: dailyRouletteStatus(profile) }); return; }
     if (type === "claim_daily_roulette") {
+      if (!dailyRouletteStatus(profile).available) throw Error("La roulette quotidienne a déjà été jouée aujourd'hui");
+      if (!await store.consumeQuota(addressFingerprint, "daily_roulette", dailyRouletteIpLimit, persistentQuotaWindow)) {
+        console.warn(`[security] Daily roulette quota reached for ${addressFingerprint.slice(0, 12)}`);
+        throw Error("La limite quotidienne de roulettes pour ce réseau est atteinte");
+      }
       const rouletteResult = claimDailyRoulette(profile, crypto.randomInt(DAILY_ROULETTE_SEGMENTS.length));
       await store.save(profile, accounts);
       send(ws, "daily_roulette_result", rouletteResult);
@@ -103,13 +174,14 @@ wss.on("connection", ws => {
       return;
     }
     if (type === "create_room") {
+      if (currentRoomFor(profile.id)) throw Error("Quittez votre table actuelle avant d'en créer une autre");
       const code = roomCode();
       const game = String(message.game ?? "blackjack");
       const RoomClass = game === "roulette" ? RouletteRoom : GameRoom;
-      const room = new RoomClass({ code, name: code, host: profile, onUpdate: updatedRoom => void saveRoomProfiles(updatedRoom).then(() => { broadcast(updatedRoom); broadcastRoomList(); }) });
+      const room = new RoomClass({ code, name: code, host: profile, onUpdate: roomUpdateHandler() });
       rooms.set(room.code, room); console.log(`[room] ${profile.username} created ${room.game} table ${code}`); broadcast(room); broadcastRoomList(); return;
     }
-    if (type === "join_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); const seatsOpen = room.game === "roulette" ? room.phase === "betting" : room.phase === "lobby"; if (seatsOpen) room.addPlayer(profile); else room.addSpectator(profile); await store.save(profile, accounts); console.log(`[room] ${profile.username} joined ${room.game} table ${room.code} as ${seatsOpen ? "player" : "spectator"}`); broadcast(room); broadcastRoomList(); return; }
+    if (type === "join_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); const currentRoom = currentRoomFor(profile.id); if (currentRoom && currentRoom !== room) throw Error("Quittez votre table actuelle avant d'en rejoindre une autre"); if (currentRoom === room) { broadcast(room); return; } const seatsOpen = room.game === "roulette" ? room.phase === "betting" : room.phase === "lobby"; if (seatsOpen) room.addPlayer(profile); else room.addSpectator(profile); await store.save(profile, accounts); console.log(`[room] ${profile.username} joined ${room.game} table ${room.code} as ${seatsOpen ? "player" : "spectator"}`); broadcast(room); broadcastRoomList(); return; }
     if (type === "spectate_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); const currentRoom = [...rooms.values()].find(candidate => candidate.players.has(profile.id) || candidate.spectators.has(profile.id)); if (currentRoom && currentRoom !== room) throw Error("Leave your current room first"); if (!currentRoom) room.addSpectator(profile); await store.save(profile, accounts); console.log(`[room] ${profile.username} joined table ${room.code} as spectator`); broadcast(room); broadcastRoomList(); return; }
     if (type === "resume_room") {
       const room = rooms.get(String(message.code ?? "").trim().toUpperCase());
@@ -129,7 +201,8 @@ wss.on("connection", ws => {
       }
       return;
     }
-    const room = [...rooms.values()].find(candidate => candidate.players.has(profile.id) || candidate.spectators.has(profile.id)); if (!room) throw Error("Join a room first");
+    const room = currentRoomFor(profile.id); if (!room) throw Error("Join a room first");
+    const phaseBeforeAction = room.phase;
     if (type === "leave_room") {
       await removeFromRoom(room, profile);
       send(ws, "left_room", { profile });
@@ -149,12 +222,19 @@ wss.on("connection", ws => {
     else if (type === "ready") room.readyPlayer(profile.id);
     else if (type === "unready") room.unreadyPlayer(profile.id);
     else if (type === "start") room.startIfReady(); else if (type === "hit") room.hit(profile.id); else if (type === "stand") room.stand(profile.id); else if (type === "dealer_hit") room.dealerHit(profile.id); else if (type === "dealer_stand") room.dealerStand(profile.id); else if (type === "double") room.double(profile.id); else if (type === "split") room.split(profile.id); else if (type === "surrender") room.surrender(profile.id); else if (type === "next_round") room.nextRound(); else if (type === "become_dealer") room.setDealer(profile.id); else if (type === "leave_dealer") room.removeDealer(profile.id); else throw Error("Unknown action");
-    await saveRoomProfiles(room); broadcast(room); broadcastRoomList();
+    await saveRoomProfiles(room); broadcast(room);
+    if (room.phase !== phaseBeforeAction) broadcastRoomList();
   } catch (error) {
     console.warn(`[error] ${profile?.username ?? "anonymous"} → ${messageType}: ${error.message}`);
     fail(ws, error.message);
   } });
   ws.on("close", () => {
+    if (!connectionReleased) {
+      connectionReleased = true;
+      const remainingConnections = Math.max(0, (connectionCounts.get(addressFingerprint) ?? 1) - 1);
+      if (remainingConnections) connectionCounts.set(addressFingerprint, remainingConnections);
+      else connectionCounts.delete(addressFingerprint);
+    }
     // Do not remove a player when an older socket closes after a reconnect.
     if (!profile || sockets.get(profile.id) !== ws) return;
     console.log(`[player] ${profile.username} disconnected`);
