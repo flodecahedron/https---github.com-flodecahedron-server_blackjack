@@ -6,8 +6,10 @@ import { GameRoom } from "./game-room.js";
 import { RouletteRoom } from "./roulette-room.js";
 import { PlayerStore } from "./player-store.js";
 import { FixedWindowRateLimiter, fingerprintAddress, getClientAddress, readIntegerSetting } from "./security.js";
+import { isGoogleAuthConfigured, verifyGoogleIdToken } from "./google-auth.js";
 
 const accounts = new Map(), rooms = new Map(), sockets = new Map(), store = new PlayerStore();
+const authByPlayer = new Map(), playerByGoogleSubject = new Map();
 const abuseHashSecret = String(process.env.ABUSE_HASH_SECRET ?? "").trim();
 if (process.env.DATABASE_URL && !abuseHashSecret) throw Error("ABUSE_HASH_SECRET is required when DATABASE_URL is configured");
 const addressHashSecret = abuseHashSecret || crypto.randomBytes(32).toString("hex");
@@ -19,6 +21,7 @@ const stateActionLimitPerTenSeconds = readIntegerSetting("STATE_ACTION_LIMIT_PER
 const connectionCounts = new Map();
 const trafficLimiter = new FixedWindowRateLimiter();
 const persistentQuotaWindow = 24 * 60 * 60 * 1000;
+const allowGuestAuth = String(process.env.ALLOW_GUEST_AUTH ?? "true").toLowerCase() === "true";
 const STATE_CHANGING_ACTIONS = new Set([
   "create_room", "join_room", "spectate_room", "resume_room", "leave_room", "take_seat", "become_spectator",
   "roulette_bet", "roulette_clear_bets", "ready", "unready", "bet", "start", "hit", "stand", "dealer_hit",
@@ -26,6 +29,14 @@ const STATE_CHANGING_ACTIONS = new Set([
 ]);
 const ROOM_CODES = ["ABLE", "BAKE", "BIRD", "BLUE", "BOLD", "CALM", "DARK", "DOVE", "EAST", "FIRE", "GOLD", "HILL", "JUMP", "LIME", "MOON", "ROSE", "SAND", "STAR", "WAVE", "WIND"];
 const id = () => crypto.randomUUID();
+const sessionTokenHash = token => crypto.createHash("sha256").update(token).digest("hex");
+const newSessionToken = () => crypto.randomBytes(32).toString("base64url");
+const sessionTokenMatches = (token, expectedHash) => {
+  if (!token || !expectedHash) return false;
+  const actual = Buffer.from(sessionTokenHash(String(token)), "hex");
+  const expected = Buffer.from(expectedHash, "hex");
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+};
 const send = (ws, type, payload) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ type, ...payload }));
 const fail = (ws, message) => send(ws, "error", { message });
 const roomSummary = room => ({
@@ -82,6 +93,18 @@ const replaceActiveSocket = (profileId, ws) => {
   if (previous && previous !== ws) previous.close(4001, "Session replaced");
 };
 
+const finishAuthentication = async (ws, profile, sessionToken = null) => {
+  replaceActiveSocket(profile.id, ws);
+  const dailyGift = dailyReward(profile);
+  await store.save(profile, accounts);
+  const payload = { profile, dailyReward: dailyGift.amount, dailyGift, dailyRoulette: dailyRouletteStatus(profile) };
+  if (sessionToken) payload.sessionToken = sessionToken;
+  send(ws, "authenticated", payload);
+  sendRoomList(ws);
+  sendLeaderboard(ws);
+  return dailyGift;
+};
+
 const roomUpdateHandler = () => {
   let lastPublishedPhase = null;
   return updatedRoom => {
@@ -112,6 +135,8 @@ wss.on("connection", (ws, request) => {
   let profile = null;
   let messageType = "unknown";
   let connectionReleased = false;
+  let googleNonce = null;
+  let googleNonceExpiresAt = 0;
   console.log(`[socket] Client connected (${addressFingerprint.slice(0, 12)})`);
   ws.on("message", async raw => { try {
     const ipTrafficKey = `ip:${addressFingerprint}`;
@@ -136,7 +161,50 @@ wss.on("connection", (ws, request) => {
       ws.close(1008, "Action rate limit");
       return;
     }
+    if (type === "request_google_auth") {
+      if (!isGoogleAuthConfigured()) throw Error("Connexion Google non configurée sur le serveur");
+      googleNonce = crypto.randomBytes(32).toString("base64url");
+      googleNonceExpiresAt = Date.now() + 2 * 60 * 1000;
+      send(ws, "google_auth_nonce", { nonce: googleNonce });
+      return;
+    }
+    if (type === "google_login") {
+      if (!googleNonce || Date.now() > googleNonceExpiresAt) throw Error("Demandez une nouvelle connexion Google");
+      const identity = await verifyGoogleIdToken(message.idToken, googleNonce);
+      googleNonce = null;
+      googleNonceExpiresAt = 0;
+
+      const linkedPlayerId = playerByGoogleSubject.get(identity.sub);
+      let googleProfile = linkedPlayerId ? accounts.get(linkedPlayerId) : null;
+      if (profile && googleProfile && googleProfile.id !== profile.id) throw Error("Ce compte Google est déjà associé à un autre joueur");
+      if (profile && !googleProfile) {
+        const existingAuth = authByPlayer.get(profile.id);
+        if (existingAuth?.googleSub && existingAuth.googleSub !== identity.sub) throw Error("Ce joueur est déjà associé à un autre compte Google");
+        googleProfile = profile;
+      }
+      if (!googleProfile) {
+        const username = String(message.username ?? "").trim();
+        if (!/^[\w-]{3,16}$/.test(username)) throw Error("Choisissez un pseudo de 3 à 16 caractères");
+        if ([...accounts.values()].some(account => account.username.toLowerCase() === username.toLowerCase())) throw Error("Pseudo déjà utilisé");
+        if (!await store.consumeQuota(addressFingerprint, "register", registrationIpLimit, persistentQuotaWindow)) throw Error("Trop de comptes ont été créés depuis ce réseau aujourd'hui");
+        googleProfile = { id: id(), username, avatar: "", balance: 1000, loginStreak: 0, lastLogin: null, lastRoulette: null };
+        accounts.set(googleProfile.id, googleProfile);
+        await store.save(googleProfile, accounts);
+      }
+
+      const issuedToken = newSessionToken();
+      const authRecord = { playerId: googleProfile.id, googleSub: identity.sub, email: identity.email, sessionTokenHash: sessionTokenHash(issuedToken) };
+      await store.saveAuthAccount(authRecord);
+      authByPlayer.set(googleProfile.id, authRecord);
+      playerByGoogleSubject.set(identity.sub, googleProfile.id);
+      profile = googleProfile;
+      const dailyGift = await finishAuthentication(ws, profile, issuedToken);
+      console.log(`[player] ${profile.username} authenticated with Google`);
+      if (dailyGift.amount > 0) console.log(`[reward] ${profile.username} received ${dailyGift.amount} daily chips`);
+      return;
+    }
     if (type === "register") {
+      if (!allowGuestAuth) throw Error("Utilisez Connexion avec Google pour créer votre compte");
       const username = String(message.username ?? "").trim();
       if (!/^[\w-]{3,16}$/.test(username)) throw Error("Pseudo: 3 à 16 caractères");
       if ([...accounts.values()].some(account => account.username.toLowerCase() === username.toLowerCase())) throw Error("Pseudo déjà utilisé");
@@ -145,16 +213,34 @@ wss.on("connection", (ws, request) => {
         throw Error("Trop de comptes ont été créés depuis ce réseau aujourd'hui");
       }
       profile = { id: id(), username, avatar: String(message.avatar ?? ""), balance: 1000, loginStreak: 0, lastLogin: null, lastRoulette: null };
-      accounts.set(profile.id, profile); replaceActiveSocket(profile.id, ws);
-      const dailyGift = dailyReward(profile); await store.save(profile, accounts);
+      accounts.set(profile.id, profile);
+      const issuedToken = newSessionToken();
+      const authRecord = { playerId: profile.id, googleSub: null, email: null, sessionTokenHash: sessionTokenHash(issuedToken) };
+      await store.save(profile, accounts);
+      await store.saveAuthAccount(authRecord);
+      authByPlayer.set(profile.id, authRecord);
+      const dailyGift = await finishAuthentication(ws, profile, issuedToken);
       console.log(`[player] ${profile.username} created an account and connected`);
-      send(ws, "authenticated", { profile, dailyReward: dailyGift.amount, dailyGift, dailyRoulette: dailyRouletteStatus(profile) }); sendRoomList(ws); sendLeaderboard(ws); return;
+      return;
     }
     if (type === "login") {
       profile = accounts.get(String(message.accountId)); if (!profile) throw Error("Compte introuvable");
-      replaceActiveSocket(profile.id, ws); const dailyGift = dailyReward(profile); await store.save(profile, accounts);
+      let authRecord = authByPlayer.get(profile.id);
+      if (authRecord) {
+        if (!sessionTokenMatches(message.sessionToken, authRecord.sessionTokenHash)) throw Error("Session expirée : reconnectez-vous avec Google");
+      } else {
+        if (!allowGuestAuth) throw Error("Reconnectez-vous avec Google");
+        const issuedToken = newSessionToken();
+        authRecord = { playerId: profile.id, googleSub: null, email: null, sessionTokenHash: sessionTokenHash(issuedToken) };
+        await store.saveAuthAccount(authRecord);
+        authByPlayer.set(profile.id, authRecord);
+        const dailyGift = await finishAuthentication(ws, profile, issuedToken);
+        console.log(`[player] ${profile.username} upgraded to a secured local session`);
+        return;
+      }
+      await finishAuthentication(ws, profile);
       console.log(`[player] ${profile.username} connected`);
-      send(ws, "authenticated", { profile, dailyReward: dailyGift.amount, dailyGift, dailyRoulette: dailyRouletteStatus(profile) }); sendRoomList(ws); sendLeaderboard(ws); return;
+      return;
     }
     if (!profile) throw Error("Authentication required");
     if (type === "ping") { send(ws, "pong", {}); return; }
@@ -245,4 +331,8 @@ wss.on("connection", (ws, request) => {
 
 await store.initialize();
 for (const profile of await store.loadAll()) accounts.set(profile.id, profile);
-server.listen(process.env.PORT || 3000, () => console.log(`Blackjack server listening with ${process.env.DATABASE_URL ? "PostgreSQL" : "file"} persistence`));
+for (const authRecord of await store.loadAuthAccounts()) {
+  authByPlayer.set(authRecord.playerId, authRecord);
+  if (authRecord.googleSub) playerByGoogleSubject.set(authRecord.googleSub, authRecord.playerId);
+}
+server.listen(process.env.PORT || 3000, () => console.log(`Blackjack server listening with ${process.env.DATABASE_URL ? "PostgreSQL" : "file"} persistence; Google auth ${isGoogleAuthConfigured() ? "enabled" : "disabled"}`));

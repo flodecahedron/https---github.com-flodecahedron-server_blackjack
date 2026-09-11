@@ -1,0 +1,18 @@
+# Dependencies are restored deterministically by `npm ci` on Render.
+node_modules/
+
+# Local runtime data and secrets must never be deployed.
+data/
+.env
+.env.*
+!.env.example
+
+# Logs, coverage and editor/OS metadata.
+*.log
+coverage/
+.nyc_output/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+

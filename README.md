@@ -2,36 +2,24 @@
 
 Serveur WebSocket autoritaire pour le blackjack et la roulette américaine multijoueur. Les cartes, tirages, mises, actions, soldes et gains ne sont jamais calculés par le client.
 
-## Déploiement Render recommandé
+## Déploiement Render avec Neon
 
-Le fichier `render.yaml` à la racine du dépôt serveur décrit le Web Service et PostgreSQL. Dans Render :
+Le fichier `render.yaml` à la racine du dépôt serveur décrit uniquement le Web Service. PostgreSQL est hébergé séparément chez Neon. Dans Render :
 
 1. Ouvrir **New > Blueprint** et sélectionner le dépôt Git.
-2. Vérifier que le Blueprint détecté est `render.yaml`, puis créer les ressources.
-3. Attendre que la base soit disponible et que le Web Service affiche `Live`.
-4. Ouvrir `https://<nom-du-service>.onrender.com/health`. La réponse doit contenir `"persistence":"postgres"`.
-5. Copier l'adresse du service sous la forme `wss://<nom-du-service>.onrender.com` dans `DEFAULT_URL` du fichier local `godot/scripts/network.gd`, puis reconstruire l'APK.
+2. Vérifier que le Blueprint détecté est `render.yaml`, puis créer le service.
+3. Renseigner les variables secrètes demandées par le Blueprint :
+   - `DATABASE_URL` : chaîne de connexion Neon avec `sslmode=require` ;
+   - `GOOGLE_WEB_CLIENT_ID` : ID du client OAuth de type **Application Web** ;
+   - `ABUSE_HASH_SECRET` est généré automatiquement ;
+   - `ALLOW_GUEST_AUTH` reste à `false` en production.
+4. Attendre que le Web Service affiche `Live`.
+5. Ouvrir `https://<nom-du-service>.onrender.com/health`. La réponse doit contenir `"persistence":"postgres"`.
+6. Copier l'adresse du service sous la forme `wss://<nom-du-service>.onrender.com` dans `DEFAULT_URL` du fichier local `godot/scripts/network.gd`, puis reconstruire l'APK.
 
-Ne définissez pas `PORT` : Render l'injecte. Le service utilise `npm ci`, `npm start`, le dossier racine `server` et `/health` comme health check.
+Ne définissez pas `PORT` : Render l'injecte. Le service utilise `npm ci --omit=dev`, `npm start` et `/health` comme health check. Neon doit rester la seule base configurée : le Blueprint ne crée aucune base Render. Le dossier local `node_modules` n'est jamais envoyé ; Render reconstruit uniquement les dépendances de production à partir de `package-lock.json`.
 
-### Attention à PostgreSQL gratuit
-
-Un Web Service gratuit convient au faible trafic du jeu. En revanche, une base Render PostgreSQL gratuite expire après 30 jours et ne possède pas de sauvegardes. Pour ne jamais perdre les progressions, passer uniquement la base sur un plan persistant payant, ou utiliser un PostgreSQL externe persistant. Le serveur accepte l'un ou l'autre via `DATABASE_URL`.
-
-## Migrer les comptes de l'ancienne base
-
-Installer les outils PostgreSQL (`pg_dump` et `pg_restore`), puis utiliser temporairement les URL **externes** des deux bases. Ne jamais ajouter ces URL au dépôt.
-
-```powershell
-$env:OLD_DB_URL = "postgresql://...ancienne-base..."
-$env:NEW_DB_URL = "postgresql://...nouvelle-base..."
-pg_dump --format=custom --no-owner --no-acl --dbname=$env:OLD_DB_URL --file=casino-royale.backup
-pg_restore --clean --if-exists --no-owner --no-acl --dbname=$env:NEW_DB_URL casino-royale.backup
-```
-
-Le Blueprint bloque l'accès PostgreSQL externe (`ipAllowList: []`). Pour effectuer la migration, autoriser temporairement uniquement votre adresse IP dans **Postgres > Networking**, puis remettre la liste vide. Le Web Service doit utiliser l'URL **interne** injectée automatiquement dans `DATABASE_URL`.
-
-Sans migration, les tables `blackjack_players` et `blackjack_abuse_events` sont créées automatiquement au premier démarrage.
+Il n'y a pas de migration de l'ancienne base. Les tables nécessaires, notamment `blackjack_players`, `blackjack_auth_accounts` et `blackjack_abuse_events`, sont créées automatiquement dans Neon au premier démarrage.
 
 ## Protections anti-abus
 
@@ -58,15 +46,8 @@ Sans `DATABASE_URL`, `data/players.json` est utilisé. Les quotas persistants re
 
 ## Connexion Google et intégrité de l'APK
 
-La connexion Google n'est pas une simple modification GDScript. Le client Android actuel utilise encore le nom de paquet provisoire `com.example.$genname` et l'export Gradle est désactivé. Une intégration propre nécessite :
+L'APK utilise le paquet définitif `com.bedealer.game`, un export Gradle et un plugin Android Godot v2 basé sur Credential Manager. L'ID renseigné dans `godot/scripts/google_auth.gd` et la variable Render `GOOGLE_WEB_CLIENT_ID` doivent être exactement le même ID de client OAuth **Web**. Le client OAuth **Android** sert à autoriser le paquet et la clé de signature ; son ID ne doit pas être placé dans ces champs.
 
-1. choisir un nom de paquet Android définitif et ne plus le changer ;
-2. enregistrer ce paquet et les empreintes SHA-1/SHA-256 des clés de signature dans Google Auth Platform ;
-3. créer les identifiants OAuth Android et Web ;
-4. installer le template Android Godot et activer **Use Gradle Build** ;
-5. intégrer Credential Manager dans un plugin Android Godot v2 ;
-6. envoyer l'ID token Google au serveur et le vérifier côté Node avant de retrouver le compte SQL ;
-7. offrir une action de liaison aux anciens profils afin de conserver leur solde ;
-8. après migration, refuser la création anonyme de comptes en production.
+Le serveur vérifie la signature, l'audience, l'expiration et le nonce de l'ID token, puis utilise le champ Google `sub` comme identité stable. Aucun secret OAuth Web n'est requis dans l'APK ou sur Render.
 
 Pour rendre les bots sensiblement plus difficiles que par la seule connexion Google, valider aussi un jeton **Google Play Integrity** côté serveur lors de la création du compte et des actions à forte valeur. Google Sign-In empêche l'usurpation d'un compte quand l'ID token est vérifié, mais ne garantit pas à lui seul qu'un humain n'automatise pas plusieurs comptes Google.

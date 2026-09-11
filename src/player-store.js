@@ -5,8 +5,10 @@ import { Pool } from "pg";
 export class PlayerStore {
   constructor() {
     this.filePath = process.env.PLAYER_DATA_PATH || join(process.cwd(), "data", "players.json");
+    this.authFilePath = process.env.AUTH_DATA_PATH || join(process.cwd(), "data", "auth.json");
     this.pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_URL.includes("render.com") ? { rejectUnauthorized: false } : undefined }) : null;
     this.localAbuseEvents = [];
+    this.localAuthAccounts = new Map();
   }
   async initialize() {
     if (this.pool) {
@@ -15,6 +17,7 @@ export class PlayerStore {
       await this.pool.query("ALTER TABLE blackjack_players ADD COLUMN IF NOT EXISTS last_roulette DATE");
       await this.pool.query("CREATE TABLE IF NOT EXISTS blackjack_abuse_events (id BIGSERIAL PRIMARY KEY, subject_hash CHAR(64) NOT NULL, action VARCHAR(48) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
       await this.pool.query("CREATE INDEX IF NOT EXISTS blackjack_abuse_events_lookup ON blackjack_abuse_events (subject_hash, action, created_at)");
+      await this.pool.query("CREATE TABLE IF NOT EXISTS blackjack_auth_accounts (player_id UUID PRIMARY KEY REFERENCES blackjack_players(id) ON DELETE CASCADE, google_sub TEXT UNIQUE, email TEXT, session_token_hash CHAR(64) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
       await this.pool.query("DELETE FROM blackjack_abuse_events WHERE created_at < NOW() - INTERVAL '8 days'");
       return;
     }
@@ -35,6 +38,35 @@ export class PlayerStore {
     const temporary = `${this.filePath}.tmp`;
     await writeFile(temporary, JSON.stringify([...accounts.values()], null, 2));
     await rename(temporary, this.filePath);
+  }
+
+  async loadAuthAccounts() {
+    if (this.pool) {
+      const { rows } = await this.pool.query("SELECT player_id, google_sub, email, session_token_hash FROM blackjack_auth_accounts");
+      return rows.map(row => ({ playerId: row.player_id, googleSub: row.google_sub, email: row.email, sessionTokenHash: row.session_token_hash }));
+    }
+    try {
+      const records = JSON.parse(await readFile(this.authFilePath, "utf8"));
+      this.localAuthAccounts = new Map(records.map(record => [record.playerId, record]));
+      return records;
+    } catch (error) {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    }
+  }
+
+  async saveAuthAccount(record) {
+    if (this.pool) {
+      await this.pool.query(
+        "INSERT INTO blackjack_auth_accounts (player_id, google_sub, email, session_token_hash) VALUES ($1,$2,$3,$4) ON CONFLICT (player_id) DO UPDATE SET google_sub=EXCLUDED.google_sub, email=EXCLUDED.email, session_token_hash=EXCLUDED.session_token_hash, updated_at=NOW()",
+        [record.playerId, record.googleSub ?? null, record.email ?? null, record.sessionTokenHash],
+      );
+      return;
+    }
+    this.localAuthAccounts.set(record.playerId, record);
+    const temporary = `${this.authFilePath}.tmp`;
+    await writeFile(temporary, JSON.stringify([...this.localAuthAccounts.values()], null, 2));
+    await rename(temporary, this.authFilePath);
   }
 
   /**
