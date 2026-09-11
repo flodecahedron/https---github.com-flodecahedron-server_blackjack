@@ -224,20 +224,23 @@ wss.on("connection", (ws, request) => {
       return;
     }
     if (type === "login") {
-      profile = accounts.get(String(message.accountId)); if (!profile) throw Error("Compte introuvable");
-      let authRecord = authByPlayer.get(profile.id);
+      const loginProfile = accounts.get(String(message.accountId));
+      if (!loginProfile) throw Error("Compte introuvable");
+      let authRecord = authByPlayer.get(loginProfile.id);
       if (authRecord) {
         if (!sessionTokenMatches(message.sessionToken, authRecord.sessionTokenHash)) throw Error("Session expirée : reconnectez-vous avec Google");
       } else {
         if (!allowGuestAuth) throw Error("Reconnectez-vous avec Google");
         const issuedToken = newSessionToken();
-        authRecord = { playerId: profile.id, googleSub: null, email: null, sessionTokenHash: sessionTokenHash(issuedToken) };
+        authRecord = { playerId: loginProfile.id, googleSub: null, email: null, sessionTokenHash: sessionTokenHash(issuedToken) };
         await store.saveAuthAccount(authRecord);
-        authByPlayer.set(profile.id, authRecord);
+        authByPlayer.set(loginProfile.id, authRecord);
+        profile = loginProfile;
         const dailyGift = await finishAuthentication(ws, profile, issuedToken);
         console.log(`[player] ${profile.username} upgraded to a secured local session`);
         return;
       }
+      profile = loginProfile;
       await finishAuthentication(ws, profile);
       console.log(`[player] ${profile.username} connected`);
       return;
