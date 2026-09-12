@@ -214,6 +214,7 @@ wss.on("connection", (ws, request) => {
       }
       if (!googleProfile) {
         const username = String(message.username ?? "").trim();
+        if (!username) throw Error("Aucun compte lié à ce compte Google. Créez un compte et choisissez un pseudo.");
         if (!/^[\w-]{3,16}$/.test(username)) throw Error("Choisissez un pseudo de 3 à 16 caractères");
         if ([...accounts.values()].some(account => account.username.toLowerCase() === username.toLowerCase())) throw Error("Pseudo déjà utilisé");
         if (!await store.consumeQuota(addressFingerprint, "register", registrationIpLimit, persistentQuotaWindow)) throw Error("Trop de comptes ont été créés depuis ce réseau aujourd'hui");
