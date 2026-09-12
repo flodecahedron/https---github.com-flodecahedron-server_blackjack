@@ -1,10 +1,12 @@
+import crypto from "node:crypto";
 import { canSplit, createShoe, handScores, handValue, isBlackjack } from "./blackjack.js";
+import { RoomEconomy } from "./room-economy.js";
 
 const DECK_COLORS = Object.freeze(["black", "blue", "green", "orange", "purple", "red"]);
 
 function randomDeckColor(previousColor = null) {
   const available = previousColor ? DECK_COLORS.filter(color => color !== previousColor) : DECK_COLORS;
-  return available[Math.floor(Math.random() * available.length)];
+  return available[crypto.randomInt(available.length)];
 }
 
 export class GameRoom {
@@ -14,6 +16,10 @@ export class GameRoom {
     this.players = new Map([[host.id, { profile: host, hands: [], ready: false }]]);
     this.spectators = new Map(); this.onUpdate = onUpdate;
     this.dealer = { type: "bot", name: "Casino", bankroll: Infinity, cards: [] };
+    this.dealerQueue = [];
+    this.dealerEscrow = 0;
+    this.roundId = 0;
+    this.economy = new RoomEconomy(code);
     this.shoe = createShoe(); this.deckColor = randomDeckColor(); this.shuffleSerial = 0; this.roundsSinceShuffle = 0;
     this.phase = "lobby"; this.current = null; this.roundResults = new Map();
     this.roundEvents = []; this.nextEventId = 1; this.hasCompletedRound = false;
@@ -25,68 +31,104 @@ export class GameRoom {
   publicState(viewerId) {
     const revealDealer = ["dealer_turn", "settlement", "lobby"].includes(this.phase);
     const requiredPlayers = [...this.players.values()].filter(player => player.profile.id !== this.dealer.playerId);
-    return { game: this.game, code: this.code, name: this.name, phase: this.phase, currentPlayerId: this.current?.playerId ?? null, currentHandIndex: this.current?.handIndex ?? -1, readyCount: requiredPlayers.filter(player => player.ready).length, requiredCount: requiredPlayers.length, hasCompletedRound: this.hasCompletedRound, events: this.roundEvents, timerEndsAt: this.timerEndsAt ?? null, viewerRole: this.players.has(viewerId) ? "player" : "spectator", spectators: [...this.spectators.values()].map(profile => profile.username), deck: { color: this.deckColor, shuffleSerial: this.shuffleSerial },
-      dealer: { ...this.dealer, canLeaveRole: this.phase === "lobby" && this.dealer.type === "player" && this.dealer.hasCompletedRound, cards: revealDealer ? this.dealer.cards : this.dealer.cards.map((card, i) => i ? { hidden: true } : card), value: revealDealer ? handValue(this.dealer.cards).total : null, scores: revealDealer ? handScores(this.dealer.cards) : [] },
+    return { game: this.game, code: this.code, name: this.name, phase: this.phase, currentPlayerId: this.current?.playerId ?? null, currentHandIndex: this.current?.handIndex ?? -1, readyCount: requiredPlayers.filter(player => player.ready).length, requiredCount: requiredPlayers.length, hasCompletedRound: this.hasCompletedRound, events: this.roundEvents, timerEndsAt: this.timerEndsAt ?? null, viewerRole: this.players.has(viewerId) ? "player" : "spectator", spectators: [...this.spectators.values()].map(profile => profile.username), deck: { color: this.deckColor, shuffleSerial: this.shuffleSerial }, dealerQueue: this.dealerQueue.map((id, index) => ({ id, name: this.player(id)?.profile.username ?? "Joueur", position: index + 1 })),
+      dealer: { ...this.dealer, canLeaveRole: this.phase === "lobby" && this.dealer.type === "player" && this.dealer.hasCompletedRound && this.dealerEscrow === 0, cards: revealDealer ? this.dealer.cards : this.dealer.cards.map((card, i) => i ? { hidden: true } : card), value: revealDealer ? handValue(this.dealer.cards).total : null, scores: revealDealer ? handScores(this.dealer.cards) : [] },
       players: [...this.players.entries()].map(([id, player]) => ({ id, name: player.profile.username, balance: player.profile.balance, ready: player.ready, result: this.roundResults.get(id) ?? null,
         hands: player.hands.map((hand) => ({ ...hand, value: handValue(hand.cards).total, scores: handScores(hand.cards), blackjack: isBlackjack(hand),
           canDouble: hand.status === "playing" && hand.cards.length === 2 && player.profile.balance >= hand.bet && this.canAddStake(player, hand.bet),
           canSplit: hand.status === "playing" && canSplit(hand, player.profile.balance) && this.canAddStake(player, hand.bet),
-          canSurrender: hand.status === "playing" && hand.cards.length === 2 && !hand.fromSplit })), self: id === viewerId })) };
+          canSurrender: hand.status === "playing" && hand.cards.length === 2 && !hand.fromSplit })), self: id === viewerId, dealerQueued: this.dealerQueue.includes(id), dealerQueuePosition: this.dealerQueue.indexOf(id) + 1 })) };
   }
-  ensureMinimumBalance(profile) { if (profile.balance <= 0) profile.balance = 100; }
+  pendingEconomyEvents() { return this.economy.pendingEvents(); }
+  acknowledgeEconomyEvents(eventIds) { this.economy.acknowledge(eventIds); }
+  changeBalance(profile, delta, reason) { this.economy.change(profile, delta, reason, this.roundId || null); }
   addPlayer(profile) {
-    if (this.phase !== "lobby" || this.players.size >= 5) throw Error("Room unavailable");
-    this.ensureMinimumBalance(profile);
+    if (this.phase !== "lobby" || this.players.size >= 7) throw Error("Room unavailable");
     this.spectators.delete(profile.id);
     this.players.set(profile.id, { profile, hands: [], ready: false });
   }
-  addSpectator(profile) { this.ensureMinimumBalance(profile); this.spectators.set(profile.id, profile); }
+  addSpectator(profile) { this.spectators.set(profile.id, profile); }
   refundLobbyBet(player) {
     const refund = this.playerTotalBet(player);
-    player.profile.balance += refund;
-    if (this.dealer.type === "player") this.dealerProfile().balance -= refund;
+    this.changeBalance(player.profile, refund, "blackjack_bet_refund");
+    this.dealerEscrow -= refund;
     player.hands = [];
     player.ready = false;
   }
   releaseHumanDealer() {
     if (this.dealer.type !== "player") return;
-    const dealerProfile = this.dealerProfile();
-    const tableStakes = [...this.players.values()].filter(player => player.profile.id !== this.dealer.playerId).reduce((sum, player) => sum + this.playerTotalBet(player), 0);
-    dealerProfile.balance -= tableStakes;
+    if (this.dealerEscrow !== 0) throw Error("Dealer role cannot change while bets are held");
     this.dealer = { type: "bot", name: "Casino", bankroll: Infinity, cards: [] };
   }
   becomeSpectator(id) {
     if (this.phase !== "lobby") throw Error("You can only spectate between rounds");
     const player = this.player(id); if (!player) throw Error("Unavailable");
+    this.removeDealerRequest(id);
     if (this.dealer.type === "player" && this.dealer.playerId === id) {
       if (!this.dealer.hasCompletedRound) throw Error("Play one round as dealer before changing role");
+      if (this.dealerEscrow > 0) throw Error("Wait until all lobby bets are cleared before changing role");
       this.releaseHumanDealer();
+      this.promoteNextDealer();
     }
     else this.refundLobbyBet(player);
     this.players.delete(id);
     this.spectators.set(id, player.profile);
   }
-  removePlayer(id) { this.players.delete(id); if (id === this.hostId && this.players.size) this.hostId = this.players.keys().next().value; }
+  removePlayer(id) {
+    this.removeDealerRequest(id);
+    this.players.delete(id);
+    if (id === this.hostId && this.players.size) this.hostId = this.players.keys().next().value;
+  }
+  assignHumanDealer(id) {
+    const player = this.player(id);
+    if (!player) return false;
+    this.dealer = { type: "player", playerId: id, name: player.profile.username, bankroll: player.profile.balance, hasCompletedRound: false, cards: [] };
+    return true;
+  }
+  promoteNextDealer() {
+    while (this.dealerQueue.length) {
+      const candidateId = this.dealerQueue.shift();
+      if (this.assignHumanDealer(candidateId)) return true;
+    }
+    return false;
+  }
+  removeDealerRequest(id) {
+    const previousLength = this.dealerQueue.length;
+    this.dealerQueue = this.dealerQueue.filter(candidateId => candidateId !== id);
+    return previousLength !== this.dealerQueue.length;
+  }
   setDealer(id) {
     const player = this.player(id); if (!player || this.phase !== "lobby") throw Error("Unavailable");
     if ([...this.players.values()].some(p => this.playerTotalBet(p) > 0)) throw Error("Choose the dealer before any bet is placed");
-    this.dealer = { type: "player", playerId: id, name: player.profile.username, bankroll: player.profile.balance, hasCompletedRound: false, cards: [] };
+    if (this.dealer.type === "bot") {
+      this.removeDealerRequest(id);
+      this.assignHumanDealer(id);
+      return "dealer";
+    }
+    if (this.dealer.playerId === id) throw Error("You are already the dealer");
+    if (this.dealerQueue.includes(id)) throw Error("You are already waiting to become dealer");
+    this.dealerQueue.push(id);
+    return "queued";
+  }
+  cancelDealerRequest(id) {
+    if (this.phase !== "lobby" || !this.removeDealerRequest(id)) throw Error("You are not waiting to become dealer");
   }
   removeDealer(id) {
     if (this.phase !== "lobby" || this.dealer.type !== "player" || this.dealer.playerId !== id) throw Error("Unavailable");
     if (!this.dealer.hasCompletedRound) throw Error("Play one round as dealer before becoming a player again");
     if ([...this.players.values()].some(p => this.playerTotalBet(p) > 0)) throw Error("Return to player before bets are placed");
     this.releaseHumanDealer();
+    this.promoteNextDealer();
   }
   placeBet(id, amount) {
     if (this.phase !== "lobby") throw Error("Betting closed"); const p = this.player(id);
     if (!p || p.ready || this.dealer.playerId === id || !Number.isInteger(amount) || amount < 1 || amount > p.profile.balance) throw Error("Invalid bet");
     if (!this.canAddStake(p, amount)) throw Error("This bet exceeds the dealer's table limit");
-    if (this.dealer.type === "player") this.dealerProfile().balance += amount;
     if (!p.hands.length) p.hands = [{ cards: [], chips: [], bet: 0, status: "playing", fromSplit: false }];
     p.hands[0].bet += amount;
     p.hands[0].chips.push(amount);
-    p.profile.balance -= amount;
+    this.changeBalance(p.profile, -amount, "blackjack_bet");
+    this.dealerEscrow += amount;
     this.startBetTimer();
   }
   readyPlayer(id) {
@@ -138,6 +180,7 @@ export class GameRoom {
     const active = required.filter(p => p.ready);
     if (!required.length || !required.every(p => p.ready && p.hands.length && p.hands[0].bet > 0)) throw Error("Waiting for every player to validate a bet");
     if (this.betTimer) { clearTimeout(this.betTimer); this.betTimer = null; this.timerEndsAt = null; }
+    this.roundId += 1;
     this.dealer.cards = []; this.roundResults.clear(); this.roundEvents = [];
     for (let i = 0; i < 2; i++) { for (const p of active) p.hands[0].cards.push(this.draw()); this.dealer.cards.push(this.draw()); }
     for (const player of active) if (isBlackjack(player.hands[0])) {
@@ -163,8 +206,8 @@ export class GameRoom {
   assertTurn(id) { if (this.phase !== "player_turn" || this.current.playerId !== id) throw Error("Not your turn"); return this.player(id).hands[this.current.handIndex]; }
   hit(id) { const hand = this.assertTurn(id); hand.cards.push(this.draw()); this.recordTerminalHandEvent(id, hand); if (handValue(hand.cards).total >= 21) { hand.status = "stood"; this.advance(); } }
   stand(id) { const hand = this.assertTurn(id); hand.status = "stood"; this.advance(); }
-  double(id) { const hand = this.assertTurn(id); const p = this.player(id); if (hand.cards.length !== 2 || p.profile.balance < hand.bet || !this.canAddStake(p, hand.bet)) throw Error("Cannot double"); p.profile.balance -= hand.bet; if (this.dealer.type === "player") this.dealerProfile().balance += hand.bet; hand.chips.push(hand.bet); hand.bet *= 2; hand.cards.push(this.draw()); this.recordTerminalHandEvent(id, hand); hand.status = "stood"; this.advance(); }
-  split(id) { const hand = this.assertTurn(id); const p = this.player(id); if (!canSplit(hand, p.profile.balance) || !this.canAddStake(p, hand.bet)) throw Error("Cannot split"); p.profile.balance -= hand.bet; if (this.dealer.type === "player") this.dealerProfile().balance += hand.bet; const second = { cards: [hand.cards.pop(), this.draw()], chips: [...hand.chips], bet: hand.bet, status: "playing", fromSplit: true }; hand.fromSplit = true; hand.cards.push(this.draw()); p.hands.splice(this.current.handIndex + 1, 0, second); }
+  double(id) { const hand = this.assertTurn(id); const p = this.player(id); if (hand.cards.length !== 2 || p.profile.balance < hand.bet || !this.canAddStake(p, hand.bet)) throw Error("Cannot double"); this.changeBalance(p.profile, -hand.bet, "blackjack_double"); this.dealerEscrow += hand.bet; hand.chips.push(hand.bet); hand.bet *= 2; hand.cards.push(this.draw()); this.recordTerminalHandEvent(id, hand); hand.status = "stood"; this.advance(); }
+  split(id) { const hand = this.assertTurn(id); const p = this.player(id); if (!canSplit(hand, p.profile.balance) || !this.canAddStake(p, hand.bet)) throw Error("Cannot split"); this.changeBalance(p.profile, -hand.bet, "blackjack_split"); this.dealerEscrow += hand.bet; const second = { cards: [hand.cards.pop(), this.draw()], chips: [...hand.chips], bet: hand.bet, status: "playing", fromSplit: true }; hand.fromSplit = true; hand.cards.push(this.draw()); p.hands.splice(this.current.handIndex + 1, 0, second); }
   surrender(id) { const hand = this.assertTurn(id); if (hand.cards.length !== 2 || hand.fromSplit) throw Error("Surrender is only available on the initial hand"); hand.status = "surrendered"; this.advance(); }
   advance() {
     const entries = [...this.players.entries()].filter(([,p]) => p.ready);
@@ -250,32 +293,43 @@ export class GameRoom {
       if (isHumanDealer) {
         for (const [playerId, player] of this.players) if (playerId !== id) {
           const refund = this.playerTotalBet(player);
-          player.profile.balance += refund;
-          leaving.profile.balance -= refund;
+          this.changeBalance(player.profile, refund, "blackjack_dealer_departure_refund");
+          this.dealerEscrow -= refund;
           player.hands = [];
           player.ready = false;
         }
       } else this.refundLobbyBet(leaving);
     }
     if (isHumanDealer && !["lobby", "settlement"].includes(this.phase)) {
+      let dealerDelta = 0;
       for (const [playerId, player] of this.players) if (playerId !== id && player.ready) {
         const handResults = player.hands.map(hand => {
           const payout = hand.bet * 2;
-          player.profile.balance += payout;
-          leaving.profile.balance -= payout;
+          this.changeBalance(player.profile, payout, "blackjack_dealer_departure_win");
+          dealerDelta += hand.bet - payout;
+          this.dealerEscrow -= hand.bet;
           return { outcome: "win", net: hand.bet };
         });
         this.roundResults.set(playerId, { outcome: "win", net: handResults.reduce((sum, result) => sum + result.net, 0), hands: handResults });
         player.ready = false;
       }
+      this.changeBalance(leaving.profile, dealerDelta, "blackjack_dealer_departure_settlement");
       this.phase = "settlement";
       this.roundsSinceShuffle += 1;
       this.current = null;
       this.clearRoundTimers();
     }
+    if (!isHumanDealer && !["lobby", "settlement"].includes(this.phase)) {
+      const forfeitedStake = this.playerTotalBet(leaving);
+      this.dealerEscrow -= forfeitedStake;
+      if (this.dealer.type === "player") this.changeBalance(this.dealerProfile(), forfeitedStake, "blackjack_departure_forfeit");
+    }
     const wasCurrent = this.current?.playerId === id;
     this.removePlayer(id);
-    if (isHumanDealer) this.dealer = { type: "bot", name: "Casino", bankroll: Infinity, cards: [] };
+    if (isHumanDealer) {
+      this.dealer = { type: "bot", name: "Casino", bankroll: Infinity, cards: [] };
+      if (this.phase === "lobby") this.promoteNextDealer();
+    }
     if (wasCurrent && this.phase === "player_turn") {
       this.current = null;
       this.advance();
@@ -285,6 +339,7 @@ export class GameRoom {
   settle() {
     this.clearRoundTimers();
     const dealerValue = handValue(this.dealer.cards).total, dealerBJ = isBlackjack(this.dealer);
+    let dealerDelta = 0;
     for (const [playerId, p] of this.players) if (p.ready) {
       let net = 0, outcome = "push";
       const handResults = [];
@@ -298,17 +353,18 @@ export class GameRoom {
         const handNet = payout - hand.bet;
         net += handNet;
         handResults.push({ outcome, net: handNet });
-        p.profile.balance += payout;
-        if (this.dealer.type === "player") this.dealerProfile().balance -= payout;
+        this.changeBalance(p.profile, payout, `blackjack_${outcome}_payout`);
+        dealerDelta += hand.bet - payout;
+        this.dealerEscrow -= hand.bet;
       }
       this.roundResults.set(playerId, { outcome, net, dealerBlackjack: dealerBJ, hands: handResults });
-      if (p.profile.balance <= 0) {
-        p.profile.balance = 100;
-        this.addRoundEvent(playerId, "casino_gift");
-      }
       p.ready = false;
     }
-    if (this.dealer.type === "player") this.dealer.hasCompletedRound = true;
+    if (this.dealer.type === "player") {
+      this.changeBalance(this.dealerProfile(), dealerDelta, "blackjack_dealer_settlement");
+      this.dealer.hasCompletedRound = true;
+    }
+    if (this.dealerEscrow !== 0) throw Error("Blackjack escrow did not settle to zero");
     this.roundsSinceShuffle += 1;
     this.phase = "settlement"; this.current = null;
   }
@@ -317,5 +373,10 @@ export class GameRoom {
     if (this.roundsSinceShuffle >= 3) this.shuffleDeck();
     this.phase = "lobby"; this.hasCompletedRound = true; this.dealer.cards = []; this.roundResults.clear(); this.roundEvents = [];
     for (const [,p] of this.players) p.hands = [];
+    if (this.dealer.type === "player" && this.dealerQueue.length) {
+      this.dealer = { type: "bot", name: "Casino", bankroll: Infinity, cards: [] };
+      this.promoteNextDealer();
+    } else if (this.dealer.type === "bot") this.promoteNextDealer();
+    if (this.dealer.type === "player") this.dealer.bankroll = this.dealerProfile().balance;
   }
 }

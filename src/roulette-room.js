@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { RoomEconomy } from "./room-economy.js";
 
 export const AMERICAN_WHEEL = Object.freeze([
   "0", "28", "9", "26", "30", "11", "7", "20", "32", "17", "5", "22", "34", "15", "3", "24", "36", "13", "1",
@@ -56,12 +57,15 @@ export class RouletteRoom {
     this.winningPocket = null;
     this.roundId = 0;
     this.roundTimer = null;
+    this.economy = new RoomEconomy(code);
   }
 
   notify() { if (this.onUpdate) this.onUpdate(this); }
   schedule(callback, milliseconds) { const timer = setTimeout(callback, milliseconds); timer.unref?.(); return timer; }
   player(id) { return this.players.get(id); }
-  ensureMinimumBalance(profile) { if (profile.balance <= 0) profile.balance = 100; }
+  pendingEconomyEvents() { return this.economy.pendingEvents(); }
+  acknowledgeEconomyEvents(eventIds) { this.economy.acknowledge(eventIds); }
+  changeBalance(profile, delta, reason) { this.economy.change(profile, delta, reason, this.roundId || null); }
   totalBet(player) { return player.bets.reduce((sum, bet) => sum + bet.amount, 0); }
 
   publicState(viewerId) {
@@ -94,13 +98,11 @@ export class RouletteRoom {
 
   addPlayer(profile) {
     if (this.phase !== "betting" || this.players.size >= 7) throw Error("Table de roulette indisponible");
-    this.ensureMinimumBalance(profile);
     this.spectators.delete(profile.id);
     if (!this.players.has(profile.id)) this.players.set(profile.id, { profile, bets: [], ready: false, result: null });
   }
 
   addSpectator(profile) {
-    this.ensureMinimumBalance(profile);
     this.spectators.set(profile.id, profile);
   }
 
@@ -112,7 +114,7 @@ export class RouletteRoom {
     const existing = player.bets.find(candidate => candidate.kind === bet.kind && candidate.value === bet.value);
     if (existing) existing.amount += amount;
     else player.bets.push({ ...bet, amount });
-    player.profile.balance -= amount;
+    this.changeBalance(player.profile, -amount, "roulette_bet");
     player.result = null;
     this.startBettingTimer();
   }
@@ -121,7 +123,7 @@ export class RouletteRoom {
     if (this.phase !== "betting") throw Error("Les mises sont fermées");
     const player = this.player(id);
     if (!player || player.ready) throw Error("Mises indisponibles");
-    player.profile.balance += this.totalBet(player);
+    this.changeBalance(player.profile, this.totalBet(player), "roulette_bet_refund");
     player.bets = [];
   }
 
@@ -153,7 +155,7 @@ export class RouletteRoom {
 
   expireBetting() {
     for (const [id, player] of this.players) if (!player.ready) {
-      player.profile.balance += this.totalBet(player);
+      this.changeBalance(player.profile, this.totalBet(player), "roulette_timeout_refund");
       player.bets = [];
       this.players.delete(id);
       this.spectators.set(id, player.profile);
@@ -188,9 +190,8 @@ export class RouletteRoom {
         winningBets.push({ kind: bet.kind, value: bet.value, amount: bet.amount, payout: returned });
       }
       const stake = this.totalBet(player);
-      player.profile.balance += payout;
+      this.changeBalance(player.profile, payout, "roulette_payout");
       player.result = { outcome: payout > stake ? "win" : payout === stake ? "push" : "loss", net: payout - stake, payout, winningBets };
-      if (player.profile.balance <= 0) player.profile.balance = 100;
       player.ready = false;
     }
     this.phase = "results";
@@ -217,7 +218,7 @@ export class RouletteRoom {
     if (this.phase !== "betting") throw Error("Vous pourrez devenir spectateur après le tirage");
     const player = this.player(id);
     if (!player) throw Error("Joueur indisponible");
-    player.profile.balance += this.totalBet(player);
+    this.changeBalance(player.profile, this.totalBet(player), "roulette_spectator_refund");
     this.players.delete(id);
     this.spectators.set(id, player.profile);
   }
@@ -226,7 +227,7 @@ export class RouletteRoom {
     if (this.spectators.delete(id)) return true;
     const player = this.player(id);
     if (!player) return false;
-    if (this.phase === "betting") player.profile.balance += this.totalBet(player);
+    if (this.phase === "betting") this.changeBalance(player.profile, this.totalBet(player), "roulette_departure_refund");
     this.players.delete(id);
     if (id === this.hostId && this.players.size) this.hostId = this.players.keys().next().value;
     return true;

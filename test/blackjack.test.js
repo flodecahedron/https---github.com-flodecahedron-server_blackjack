@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DAILY_ROULETTE_SEGMENTS, canSplit, claimDailyRoulette, dailyReward, dailyRouletteStatus, handValue, isBlackjack } from "../src/blackjack.js";
 import { GameRoom } from "../src/game-room.js";
+import { PlayerStore } from "../src/player-store.js";
 
 const card = (rank) => ({ rank, suit: "spades" });
 
@@ -61,6 +62,8 @@ test("a human dealer receives a losing player's stake", () => {
   room.addPlayer(player);
   room.setDealer(dealer.id);
   room.placeBet(player.id, 10);
+  assert.equal(dealer.balance, 5000);
+  assert.equal(room.dealerEscrow, 10);
   room.player(player.id).ready = true;
   room.player(player.id).hands[0].cards = [card("10"), card("6")];
   room.dealer.cards = [card("10"), card("7")];
@@ -83,8 +86,8 @@ test("split hands settle independently against a human dealer", () => {
     { cards: [card("10"), card("10"), card("5")], chips: [10], bet: 10, status: "stood", fromSplit: true },
     { cards: [card("10"), card("9")], chips: [10], bet: 10, status: "stood", fromSplit: true },
   ];
-  player.balance -= 10;
-  dealer.balance += 10;
+  room.changeBalance(player, -10, "blackjack_split");
+  room.dealerEscrow += 10;
   room.dealer.cards = [card("10"), card("7")];
   room.settle();
   assert.equal(dealer.balance, 5000);
@@ -159,7 +162,7 @@ test("daily roulette prize frequency decreases as values rise", () => {
   }
 });
 
-test("a player with no chips after settlement receives the casino safety grant", () => {
+test("settlement leaves a broke player eligible for the separate safety grant", async () => {
   const profile = { id: "player-1", username: "Test", balance: 1 };
   const room = new GameRoom({ code: "1234", name: "TEST", host: profile });
   room.placeBet(profile.id, 1);
@@ -167,16 +170,40 @@ test("a player with no chips after settlement receives the casino safety grant",
   room.player(profile.id).hands[0].cards = [card("10"), card("8"), card("K")];
   room.dealer.cards = [card("10"), card("7")];
   room.settle();
+  assert.equal(profile.balance, 0);
+  const store = new PlayerStore();
+  store.save = async () => {};
+  const grant = await store.claimSafetyGrant(profile, new Map([[profile.id, profile]]), { now: new Date("2026-09-01T12:00:00Z") });
+  assert.equal(grant.granted, true);
+  assert.equal(grant.kind, "free");
   assert.equal(profile.balance, 100);
-  assert.equal(room.roundEvents.at(-1).type, "casino_gift");
 });
 
-test("a player is restored to 100 chips when joining a room with no balance", () => {
+test("the safety net grants once freely, then uses capped simulated rewarded grants", async () => {
+  const profile = { id: "broke", username: "Broke", balance: 0 };
+  const accounts = new Map([[profile.id, profile]]);
+  const store = new PlayerStore();
+  store.save = async () => {};
+  const now = new Date("2026-09-01T12:00:00Z");
+  const free = await store.claimSafetyGrant(profile, accounts, { now });
+  assert.equal(free.kind, "free");
+  for (let index = 0; index < 3; index++) {
+    profile.balance = 0;
+    const rewarded = await store.claimSafetyGrant(profile, accounts, { rewarded: true, now });
+    assert.equal(rewarded.kind, "rewarded_simulated");
+  }
+  profile.balance = 0;
+  const capped = await store.claimSafetyGrant(profile, accounts, { rewarded: true, now });
+  assert.equal(capped.granted, false);
+  assert.equal(capped.reason, "rewarded_unavailable");
+});
+
+test("joining a room does not silently mint chips outside the economy service", () => {
   const host = { id: "host", username: "Host", balance: 1000 };
   const brokePlayer = { id: "broke", username: "Broke", balance: 0 };
   const room = new GameRoom({ code: "1234", name: "TEST", host });
   room.addPlayer(brokePlayer);
-  assert.equal(brokePlayer.balance, 100);
+  assert.equal(brokePlayer.balance, 0);
 });
 
 test("the shoe and card-back color change after every third completed round", () => {
@@ -213,10 +240,54 @@ test("a human dealer becoming spectator returns the dealer role to the casino", 
   room.setDealer(dealer.id);
   room.placeBet(player.id, 20);
   room.dealer.hasCompletedRound = true;
+  assert.throws(() => room.becomeSpectator(dealer.id), /bets are cleared/);
+  room.becomeSpectator(player.id);
   room.becomeSpectator(dealer.id);
   assert.equal(room.dealer.type, "bot");
   assert.equal(dealer.balance, 1000);
   assert.equal(room.spectators.has(dealer.id), true);
+});
+
+test("dealer volunteers wait in FIFO order and rotate after one completed round", () => {
+  const first = { id: "first", username: "First", balance: 1000 };
+  const second = { id: "second", username: "Second", balance: 1000 };
+  const third = { id: "third", username: "Third", balance: 1000 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: first });
+  room.addPlayer(second);
+  room.addPlayer(third);
+  room.setDealer(first.id);
+  assert.equal(room.setDealer(second.id), "queued");
+  assert.equal(room.setDealer(third.id), "queued");
+  assert.equal(room.dealer.playerId, first.id);
+  room.dealer.hasCompletedRound = true;
+  room.phase = "settlement";
+  room.nextRound();
+  assert.equal(room.dealer.playerId, second.id);
+  assert.deepEqual(room.dealerQueue, [third.id]);
+});
+
+test("a queued dealer volunteer can cancel without changing the active dealer", () => {
+  const first = { id: "first", username: "First", balance: 1000 };
+  const second = { id: "second", username: "Second", balance: 1000 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: first });
+  room.addPlayer(second);
+  room.setDealer(first.id);
+  room.setDealer(second.id);
+  room.cancelDealerRequest(second.id);
+  assert.equal(room.dealer.playerId, first.id);
+  assert.deepEqual(room.dealerQueue, []);
+});
+
+test("a human dealer's table limit is not inflated by held stakes", () => {
+  const dealer = { id: "dealer", username: "Dealer", balance: 150 };
+  const player = { id: "player", username: "Player", balance: 1000 };
+  const room = new GameRoom({ code: "1234", name: "TEST", host: dealer });
+  room.addPlayer(player);
+  room.setDealer(dealer.id);
+  room.placeBet(player.id, 100);
+  assert.equal(dealer.balance, 150);
+  assert.equal(room.dealer.bankroll, 150);
+  assert.throws(() => room.placeBet(player.id, 1), /table limit/);
 });
 
 test("a player cannot become dealer after a bet is placed", () => {

@@ -19,7 +19,13 @@ Le fichier `render.yaml` à la racine du dépôt serveur décrit uniquement le W
 
 Ne définissez pas `PORT` : Render l'injecte. Le service utilise `npm ci --omit=dev`, `npm start` et `/health` comme health check. Neon doit rester la seule base configurée : le Blueprint ne crée aucune base Render. Le dossier local `node_modules` n'est jamais envoyé ; Render reconstruit uniquement les dépendances de production à partir de `package-lock.json`.
 
-Il n'y a pas de migration de l'ancienne base. Les tables nécessaires, notamment `blackjack_players`, `blackjack_auth_accounts` et `blackjack_abuse_events`, sont créées automatiquement dans Neon au premier démarrage.
+Les migrations SQL versionnées du dossier `migrations/` sont appliquées automatiquement et une seule fois au démarrage. Elles créent notamment `blackjack_players`, `blackjack_auth_accounts`, `blackjack_abuse_events` et le journal financier `blackjack_chip_ledger`.
+
+## Économie et jetons de secours
+
+Les variations de solde produites par une room sont enregistrées de façon idempotente dans `blackjack_chip_ledger`. Les mises contre un croupier humain sont conservées dans le séquestre de la table : elles ne gonflent jamais son solde ni sa capacité de couverture avant le règlement.
+
+Un joueur à zéro reçoit automatiquement un premier secours de 100 jetons par jour UTC. Les secours suivants simulent provisoirement une vidéo récompensée : le joueur doit les demander explicitement et le serveur les limite par défaut à trois par jour. Les variables `ALLOW_SIMULATED_REWARDED_GRANT`, `REWARDED_GRANT_DAILY_LIMIT` et `REWARDED_GRANT_COOLDOWN_MS` permettent de désactiver ou resserrer ce mode temporaire. Lors de l'intégration d'une régie publicitaire, remplacer ce mode par la validation serveur du justificatif de vidéo.
 
 ## Protections anti-abus
 

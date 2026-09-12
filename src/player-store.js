@@ -1,6 +1,14 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { Pool } from "pg";
+import { runMigrations } from "./migrations.js";
+
+const SAFETY_GRANT_AMOUNT = 100;
+const REWARDED_GRANT_DAILY_LIMIT = Number.parseInt(process.env.REWARDED_GRANT_DAILY_LIMIT ?? "3", 10);
+const REWARDED_GRANT_COOLDOWN_MS = Number.parseInt(process.env.REWARDED_GRANT_COOLDOWN_MS ?? "0", 10);
+const ALLOW_SIMULATED_REWARDED_GRANT = String(process.env.ALLOW_SIMULATED_REWARDED_GRANT ?? "true").toLowerCase() === "true";
+const utcDay = date => date.toISOString().slice(0, 10);
+const dateColumn = value => value instanceof Date ? value.toISOString().slice(0, 10) : value ? String(value).slice(0, 10) : null;
 
 export class PlayerStore {
   constructor() {
@@ -12,12 +20,7 @@ export class PlayerStore {
   }
   async initialize() {
     if (this.pool) {
-      await this.pool.query("CREATE TABLE IF NOT EXISTS blackjack_players (id UUID PRIMARY KEY, username VARCHAR(16) UNIQUE NOT NULL, avatar TEXT NOT NULL DEFAULT '', balance INTEGER NOT NULL, login_streak INTEGER NOT NULL DEFAULT 0, last_login DATE, last_roulette DATE)");
-      await this.pool.query("ALTER TABLE blackjack_players ALTER COLUMN balance TYPE INTEGER USING CEIL(balance)::INTEGER");
-      await this.pool.query("ALTER TABLE blackjack_players ADD COLUMN IF NOT EXISTS last_roulette DATE");
-      await this.pool.query("CREATE TABLE IF NOT EXISTS blackjack_abuse_events (id BIGSERIAL PRIMARY KEY, subject_hash CHAR(64) NOT NULL, action VARCHAR(48) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
-      await this.pool.query("CREATE INDEX IF NOT EXISTS blackjack_abuse_events_lookup ON blackjack_abuse_events (subject_hash, action, created_at)");
-      await this.pool.query("CREATE TABLE IF NOT EXISTS blackjack_auth_accounts (player_id UUID PRIMARY KEY REFERENCES blackjack_players(id) ON DELETE CASCADE, google_sub TEXT UNIQUE, email TEXT, session_token_hash CHAR(64) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
+      await runMigrations(this.pool);
       await this.pool.query("DELETE FROM blackjack_abuse_events WHERE created_at < NOW() - INTERVAL '8 days'");
       return;
     }
@@ -25,19 +28,173 @@ export class PlayerStore {
   }
   async loadAll() {
     if (this.pool) {
-      const { rows } = await this.pool.query("SELECT id, username, avatar, balance, login_streak, last_login, last_roulette FROM blackjack_players");
-      return rows.map(row => ({ id: row.id, username: row.username, avatar: row.avatar, balance: row.balance, loginStreak: row.login_streak, lastLogin: row.last_login ? row.last_login.toISOString().slice(0, 10) : null, lastRoulette: row.last_roulette ? row.last_roulette.toISOString().slice(0, 10) : null }));
+      const { rows } = await this.pool.query("SELECT id, username, avatar, balance, login_streak, last_login, last_roulette, last_safety_grant, rewarded_grant_date, rewarded_grant_count, last_rewarded_grant_at FROM blackjack_players");
+      return rows.map(row => ({ id: row.id, username: row.username, avatar: row.avatar, balance: row.balance, loginStreak: row.login_streak, lastLogin: dateColumn(row.last_login), lastRoulette: dateColumn(row.last_roulette), lastSafetyGrant: dateColumn(row.last_safety_grant), rewardedGrantDate: dateColumn(row.rewarded_grant_date), rewardedGrantCount: row.rewarded_grant_count ?? 0, lastRewardedGrantAt: row.last_rewarded_grant_at?.toISOString() ?? null }));
     }
     try { return JSON.parse(await readFile(this.filePath, "utf8")); } catch (error) { if (error.code === "ENOENT") return []; throw error; }
   }
   async save(profile, accounts) {
     if (this.pool) {
-      await this.pool.query("INSERT INTO blackjack_players (id, username, avatar, balance, login_streak, last_login, last_roulette) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO UPDATE SET avatar=EXCLUDED.avatar, balance=EXCLUDED.balance, login_streak=EXCLUDED.login_streak, last_login=EXCLUDED.last_login, last_roulette=EXCLUDED.last_roulette", [profile.id, profile.username, profile.avatar, profile.balance, profile.loginStreak, profile.lastLogin, profile.lastRoulette ?? null]);
+      await this.pool.query("INSERT INTO blackjack_players (id, username, avatar, balance, login_streak, last_login, last_roulette, last_safety_grant, rewarded_grant_date, rewarded_grant_count, last_rewarded_grant_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO UPDATE SET avatar=EXCLUDED.avatar, balance=EXCLUDED.balance, login_streak=EXCLUDED.login_streak, last_login=EXCLUDED.last_login, last_roulette=EXCLUDED.last_roulette, last_safety_grant=EXCLUDED.last_safety_grant, rewarded_grant_date=EXCLUDED.rewarded_grant_date, rewarded_grant_count=EXCLUDED.rewarded_grant_count, last_rewarded_grant_at=EXCLUDED.last_rewarded_grant_at", [profile.id, profile.username, profile.avatar, profile.balance, profile.loginStreak, profile.lastLogin, profile.lastRoulette ?? null, profile.lastSafetyGrant ?? null, profile.rewardedGrantDate ?? null, profile.rewardedGrantCount ?? 0, profile.lastRewardedGrantAt ?? null]);
       return;
     }
     const temporary = `${this.filePath}.tmp`;
     await writeFile(temporary, JSON.stringify([...accounts.values()], null, 2));
     await rename(temporary, this.filePath);
+  }
+
+  async applyEconomyEvents(events, accounts) {
+    if (!events.length) return;
+    if (!this.pool) {
+      const firstProfile = accounts.get(events[0].playerId);
+      if (firstProfile) await this.save(firstProfile, accounts);
+      return;
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const event of events) {
+        const inserted = await client.query(
+          "INSERT INTO blackjack_chip_ledger (id, player_id, delta, reason, room_code, round_id) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO NOTHING RETURNING id",
+          [event.id, event.playerId, event.delta, event.reason, event.roomCode ?? null, event.roundId ?? null],
+        );
+        if (!inserted.rowCount) continue;
+        const updated = await client.query(
+          "UPDATE blackjack_players SET balance=balance+$2 WHERE id=$1 AND balance+$2>=0 RETURNING balance",
+          [event.playerId, event.delta],
+        );
+        if (!updated.rowCount) throw Error(`Economy event ${event.id} could not be applied`);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async applyProfileEconomy(profile, accounts, { delta, reason, eventId }) {
+    if (!Number.isInteger(delta)) throw Error("Profile economy delta must be an integer");
+    if (!this.pool) {
+      await this.save(profile, accounts);
+      return;
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      if (delta !== 0) {
+        const inserted = await client.query(
+          "INSERT INTO blackjack_chip_ledger (id, player_id, delta, reason) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING RETURNING id",
+          [eventId, profile.id, delta, reason],
+        );
+        if (inserted.rowCount) {
+          const updated = await client.query("UPDATE blackjack_players SET balance=balance+$2 WHERE id=$1 AND balance+$2>=0 RETURNING balance", [profile.id, delta]);
+          if (!updated.rowCount) throw Error(`Profile economy event ${eventId} could not be applied`);
+        }
+      }
+      await client.query(
+        "UPDATE blackjack_players SET avatar=$2, login_streak=$3, last_login=$4, last_roulette=$5 WHERE id=$1",
+        [profile.id, profile.avatar, profile.loginStreak, profile.lastLogin, profile.lastRoulette ?? null],
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  safetyGrantStatus(profile, now = new Date()) {
+    const day = utcDay(now);
+    const freeAvailable = profile.lastSafetyGrant !== day;
+    const rewardedCount = profile.rewardedGrantDate === day ? Number(profile.rewardedGrantCount ?? 0) : 0;
+    const lastRewardedAt = profile.lastRewardedGrantAt ? new Date(profile.lastRewardedGrantAt).getTime() : 0;
+    const cooldownSeconds = Math.max(0, Math.ceil((lastRewardedAt + REWARDED_GRANT_COOLDOWN_MS - now.getTime()) / 1000));
+    return {
+      amount: SAFETY_GRANT_AMOUNT,
+      needed: profile.balance <= 0,
+      freeAvailable,
+      rewardedAvailable: !freeAvailable && ALLOW_SIMULATED_REWARDED_GRANT && rewardedCount < REWARDED_GRANT_DAILY_LIMIT && cooldownSeconds === 0,
+      simulatedRewarded: ALLOW_SIMULATED_REWARDED_GRANT,
+      rewardedCount,
+      rewardedDailyLimit: REWARDED_GRANT_DAILY_LIMIT,
+      cooldownSeconds,
+      balance: profile.balance,
+    };
+  }
+
+  async claimSafetyGrant(profile, accounts, { rewarded = false, now = new Date() } = {}) {
+    if (!this.pool) return this.claimLocalSafetyGrant(profile, accounts, { rewarded, now });
+    const day = utcDay(now);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const { rows } = await client.query("SELECT balance, last_safety_grant, rewarded_grant_date, rewarded_grant_count, last_rewarded_grant_at FROM blackjack_players WHERE id=$1 FOR UPDATE", [profile.id]);
+      if (!rows.length) throw Error("Player account not found");
+      const row = rows[0];
+      profile.balance = row.balance;
+      profile.lastSafetyGrant = dateColumn(row.last_safety_grant);
+      profile.rewardedGrantDate = dateColumn(row.rewarded_grant_date);
+      profile.rewardedGrantCount = row.rewarded_grant_count ?? 0;
+      profile.lastRewardedGrantAt = row.last_rewarded_grant_at?.toISOString() ?? null;
+      if (profile.balance > 0) {
+        await client.query("ROLLBACK");
+        return { granted: false, reason: "not_needed", ...this.safetyGrantStatus(profile, now) };
+      }
+      const free = profile.lastSafetyGrant !== day;
+      if (!free && !rewarded) {
+        await client.query("ROLLBACK");
+        return { granted: false, reason: "rewarded_required", ...this.safetyGrantStatus(profile, now) };
+      }
+      const rewardedCount = profile.rewardedGrantDate === day ? profile.rewardedGrantCount : 0;
+      const lastRewardedAt = profile.lastRewardedGrantAt ? new Date(profile.lastRewardedGrantAt).getTime() : 0;
+      if (!free && (!ALLOW_SIMULATED_REWARDED_GRANT || rewardedCount >= REWARDED_GRANT_DAILY_LIMIT || now.getTime() < lastRewardedAt + REWARDED_GRANT_COOLDOWN_MS)) {
+        await client.query("ROLLBACK");
+        return { granted: false, reason: "rewarded_unavailable", ...this.safetyGrantStatus(profile, now) };
+      }
+      const kind = free ? "free" : "rewarded_simulated";
+      const nextRewardedCount = free ? rewardedCount : rewardedCount + 1;
+      const eventId = free ? `safety:${profile.id}:${day}` : `safety:${profile.id}:${day}:rewarded:${nextRewardedCount}`;
+      await client.query("INSERT INTO blackjack_chip_ledger (id, player_id, delta, reason) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING", [eventId, profile.id, SAFETY_GRANT_AMOUNT, `safety_grant_${kind}`]);
+      const { rows: updatedRows } = await client.query(
+        free
+          ? "UPDATE blackjack_players SET balance=balance+$2, last_safety_grant=$3 WHERE id=$1 RETURNING balance, last_safety_grant, rewarded_grant_date, rewarded_grant_count, last_rewarded_grant_at"
+          : "UPDATE blackjack_players SET balance=balance+$2, rewarded_grant_date=$3, rewarded_grant_count=$4, last_rewarded_grant_at=$5 WHERE id=$1 RETURNING balance, last_safety_grant, rewarded_grant_date, rewarded_grant_count, last_rewarded_grant_at",
+        free ? [profile.id, SAFETY_GRANT_AMOUNT, day] : [profile.id, SAFETY_GRANT_AMOUNT, day, nextRewardedCount, now],
+      );
+      await client.query("COMMIT");
+      const updated = updatedRows[0];
+      profile.balance = updated.balance;
+      profile.lastSafetyGrant = dateColumn(updated.last_safety_grant);
+      profile.rewardedGrantDate = dateColumn(updated.rewarded_grant_date);
+      profile.rewardedGrantCount = updated.rewarded_grant_count ?? 0;
+      profile.lastRewardedGrantAt = updated.last_rewarded_grant_at?.toISOString() ?? null;
+      return { granted: true, kind, ...this.safetyGrantStatus(profile, now) };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async claimLocalSafetyGrant(profile, accounts, { rewarded, now }) {
+    const status = this.safetyGrantStatus(profile, now);
+    if (!status.needed) return { granted: false, reason: "not_needed", ...status };
+    if (!status.freeAvailable && (!rewarded || !status.rewardedAvailable)) return { granted: false, reason: rewarded ? "rewarded_unavailable" : "rewarded_required", ...status };
+    const day = utcDay(now);
+    const kind = status.freeAvailable ? "free" : "rewarded_simulated";
+    profile.balance += SAFETY_GRANT_AMOUNT;
+    if (status.freeAvailable) profile.lastSafetyGrant = day;
+    else {
+      profile.rewardedGrantDate = day;
+      profile.rewardedGrantCount = status.rewardedCount + 1;
+      profile.lastRewardedGrantAt = now.toISOString();
+    }
+    await this.save(profile, accounts);
+    return { granted: true, kind, ...this.safetyGrantStatus(profile, now) };
   }
 
   async loadAuthAccounts() {

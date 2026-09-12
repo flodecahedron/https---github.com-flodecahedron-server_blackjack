@@ -25,7 +25,8 @@ const allowGuestAuth = String(process.env.ALLOW_GUEST_AUTH ?? "true").toLowerCas
 const STATE_CHANGING_ACTIONS = new Set([
   "create_room", "join_room", "spectate_room", "resume_room", "leave_room", "take_seat", "become_spectator",
   "roulette_bet", "roulette_clear_bets", "ready", "unready", "bet", "start", "hit", "stand", "dealer_hit",
-  "dealer_stand", "double", "split", "surrender", "next_round", "become_dealer", "leave_dealer",
+  "dealer_stand", "double", "split", "surrender", "next_round", "become_dealer", "leave_dealer", "leave_dealer_queue",
+  "claim_safety_grant",
 ]);
 const ROOM_CODES = ["ABLE", "BAKE", "BIRD", "BLUE", "BOLD", "CALM", "DARK", "DOVE", "EAST", "FIRE", "GOLD", "HILL", "JUMP", "LIME", "MOON", "ROSE", "SAND", "STAR", "WAVE", "WIND"];
 const id = () => crypto.randomUUID();
@@ -62,10 +63,40 @@ const roomCode = () => {
 };
 const broadcast = room => { for (const playerId of [...room.players.keys(), ...room.spectators.keys()]) if (sockets.has(playerId)) send(sockets.get(playerId), "room_state", { room: room.publicState(playerId) }); };
 const currentRoomFor = profileId => [...rooms.values()].find(room => room.players.has(profileId) || room.spectators.has(profileId));
-const saveRoomProfiles = room => Promise.all([
-  ...[...room.players.values()].map(player => player.profile),
-  ...room.spectators.values(),
-].map(profile => store.save(profile, accounts)));
+const roomPersistence = new WeakMap();
+const persistRoomEconomy = room => {
+  const events = room.pendingEconomyEvents?.() ?? [];
+  if (!events.length) return roomPersistence.get(room) ?? Promise.resolve();
+  const eventIds = events.map(event => event.id);
+  const previous = roomPersistence.get(room) ?? Promise.resolve();
+  const current = previous.catch(() => {}).then(async () => {
+    await store.applyEconomyEvents(events, accounts);
+    room.acknowledgeEconomyEvents(eventIds);
+  });
+  roomPersistence.set(room, current);
+  return current;
+};
+const restoreBrokeRoomPlayers = async room => {
+  const profiles = [...new Map([
+    ...[...room.players.values()].map(player => [player.profile.id, player.profile]),
+    ...[...room.spectators.values()].map(profile => [profile.id, profile]),
+  ]).values()];
+  for (const profile of profiles) {
+    if (profile.balance > 0) continue;
+    const roomPlayer = room.players.get(profile.id);
+    const hasCommittedBet = roomPlayer && (room.game === "roulette" ? room.totalBet(roomPlayer) : room.playerTotalBet(roomPlayer)) > 0;
+    const resultIsFinal = room.game === "roulette" ? room.phase === "results" : room.phase === "settlement";
+    if (hasCommittedBet && !resultIsFinal) continue;
+    const grant = await store.claimSafetyGrant(profile, accounts, { rewarded: false });
+    if (grant.granted && room.game === "blackjack") room.addRoundEvent(profile.id, "casino_gift");
+    const socket = sockets.get(profile.id);
+    if (socket) send(socket, "safety_grant_status", { safetyGrant: grant, profile });
+  }
+};
+const saveRoomProfiles = async room => {
+  await persistRoomEconomy(room);
+  await restoreBrokeRoomPlayers(room);
+};
 const removeFromRoom = async (room, profile) => {
   try {
     room.leavePlayer(profile.id);
@@ -74,7 +105,6 @@ const removeFromRoom = async (room, profile) => {
     room.players.delete(profile.id); room.spectators.delete(profile.id);
     if (room.dealer.type === "player" && room.dealer.playerId === profile.id) room.dealer = { type: "bot", name: "Casino", bankroll: Infinity, cards: [] };
   }
-  try { await store.save(profile, accounts); } catch (error) { console.error(`[store] Could not save ${profile.username} after leaving: ${error.message}`); }
   try { await saveRoomProfiles(room); } catch (error) { console.error(`[store] Could not save room ${room.code} after departure: ${error.message}`); }
   if (room.players.size) broadcast(room);
   else {
@@ -95,9 +125,15 @@ const replaceActiveSocket = (profileId, ws) => {
 
 const finishAuthentication = async (ws, profile, sessionToken = null) => {
   replaceActiveSocket(profile.id, ws);
+  const safetyGrant = await store.claimSafetyGrant(profile, accounts, { rewarded: false });
+  const balanceBeforeDailyGift = profile.balance;
   const dailyGift = dailyReward(profile);
-  await store.save(profile, accounts);
-  const payload = { profile, dailyReward: dailyGift.amount, dailyGift, dailyRoulette: dailyRouletteStatus(profile) };
+  await store.applyProfileEconomy(profile, accounts, {
+    delta: profile.balance - balanceBeforeDailyGift,
+    reason: "daily_login_reward",
+    eventId: `daily-login:${profile.id}:${profile.lastLogin ?? "none"}`,
+  });
+  const payload = { profile, dailyReward: dailyGift.amount, dailyGift, dailyRoulette: dailyRouletteStatus(profile), safetyGrant };
   if (sessionToken) payload.sessionToken = sessionToken;
   send(ws, "authenticated", payload);
   sendRoomList(ws);
@@ -250,14 +286,32 @@ wss.on("connection", (ws, request) => {
     if (type === "list_rooms") { sendRoomList(ws); return; }
     if (type === "get_leaderboard") { sendLeaderboard(ws); return; }
     if (type === "get_daily_roulette") { send(ws, "daily_roulette_status", { roulette: dailyRouletteStatus(profile) }); return; }
+    if (type === "get_safety_grant") { send(ws, "safety_grant_status", { safetyGrant: store.safetyGrantStatus(profile), profile }); return; }
+    if (type === "claim_safety_grant") {
+      const grantRoom = currentRoomFor(profile.id);
+      const grantPlayer = grantRoom?.players.get(profile.id);
+      const committedBet = grantPlayer ? (grantRoom.game === "roulette" ? grantRoom.totalBet(grantPlayer) : grantRoom.playerTotalBet(grantPlayer)) : 0;
+      const resultIsFinal = grantRoom ? (grantRoom.game === "roulette" ? grantRoom.phase === "results" : grantRoom.phase === "settlement") : true;
+      if (committedBet > 0 && !resultIsFinal) throw Error("Votre mise doit être réglée avant de demander des jetons de secours");
+      const safetyGrant = await store.claimSafetyGrant(profile, accounts, { rewarded: true });
+      send(ws, "safety_grant_status", { safetyGrant, profile });
+      if (grantRoom) broadcast(grantRoom);
+      sendLeaderboard(ws);
+      return;
+    }
     if (type === "claim_daily_roulette") {
       if (!dailyRouletteStatus(profile).available) throw Error("La roulette quotidienne a déjà été jouée aujourd'hui");
       if (!await store.consumeQuota(addressFingerprint, "daily_roulette", dailyRouletteIpLimit, persistentQuotaWindow)) {
         console.warn(`[security] Daily roulette quota reached for ${addressFingerprint.slice(0, 12)}`);
         throw Error("La limite quotidienne de roulettes pour ce réseau est atteinte");
       }
+      const balanceBeforeRoulette = profile.balance;
       const rouletteResult = claimDailyRoulette(profile, crypto.randomInt(DAILY_ROULETTE_SEGMENTS.length));
-      await store.save(profile, accounts);
+      await store.applyProfileEconomy(profile, accounts, {
+        delta: profile.balance - balanceBeforeRoulette,
+        reason: "daily_roulette_reward",
+        eventId: `daily-roulette:${profile.id}:${profile.lastRoulette}`,
+      });
       send(ws, "daily_roulette_result", rouletteResult);
       sendLeaderboard(ws);
       return;
@@ -270,8 +324,8 @@ wss.on("connection", (ws, request) => {
       const room = new RoomClass({ code, name: code, host: profile, onUpdate: roomUpdateHandler() });
       rooms.set(room.code, room); console.log(`[room] ${profile.username} created ${room.game} table ${code}`); broadcast(room); broadcastRoomList(); return;
     }
-    if (type === "join_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); const currentRoom = currentRoomFor(profile.id); if (currentRoom && currentRoom !== room) throw Error("Quittez votre table actuelle avant d'en rejoindre une autre"); if (currentRoom === room) { broadcast(room); return; } const seatsOpen = room.game === "roulette" ? room.phase === "betting" : room.phase === "lobby"; if (seatsOpen) room.addPlayer(profile); else room.addSpectator(profile); await store.save(profile, accounts); console.log(`[room] ${profile.username} joined ${room.game} table ${room.code} as ${seatsOpen ? "player" : "spectator"}`); broadcast(room); broadcastRoomList(); return; }
-    if (type === "spectate_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); const currentRoom = [...rooms.values()].find(candidate => candidate.players.has(profile.id) || candidate.spectators.has(profile.id)); if (currentRoom && currentRoom !== room) throw Error("Leave your current room first"); if (!currentRoom) room.addSpectator(profile); await store.save(profile, accounts); console.log(`[room] ${profile.username} joined table ${room.code} as spectator`); broadcast(room); broadcastRoomList(); return; }
+    if (type === "join_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); const currentRoom = currentRoomFor(profile.id); if (currentRoom && currentRoom !== room) throw Error("Quittez votre table actuelle avant d'en rejoindre une autre"); if (currentRoom === room) { broadcast(room); return; } const seatsOpen = room.game === "roulette" ? room.phase === "betting" : room.phase === "lobby"; if (seatsOpen) room.addPlayer(profile); else room.addSpectator(profile); console.log(`[room] ${profile.username} joined ${room.game} table ${room.code} as ${seatsOpen ? "player" : "spectator"}`); broadcast(room); broadcastRoomList(); return; }
+    if (type === "spectate_room") { const room = rooms.get(String(message.code ?? "").trim().toUpperCase()); if (!room) throw Error("Room not found"); const currentRoom = [...rooms.values()].find(candidate => candidate.players.has(profile.id) || candidate.spectators.has(profile.id)); if (currentRoom && currentRoom !== room) throw Error("Leave your current room first"); if (!currentRoom) room.addSpectator(profile); console.log(`[room] ${profile.username} joined table ${room.code} as spectator`); broadcast(room); broadcastRoomList(); return; }
     if (type === "resume_room") {
       const room = rooms.get(String(message.code ?? "").trim().toUpperCase());
       if (!room) { send(ws, "room_resume_failed", { message: "La table n'existe plus" }); return; }
@@ -282,7 +336,6 @@ wss.on("connection", (ws, request) => {
           if (seatsOpen && requestedRole !== "spectator") room.addPlayer(profile);
           else room.addSpectator(profile);
         }
-        await store.save(profile, accounts);
         console.log(`[room] ${profile.username} resumed table ${room.code}`);
         broadcast(room); broadcastRoomList();
       } catch (error) {
@@ -297,7 +350,7 @@ wss.on("connection", (ws, request) => {
       send(ws, "left_room", { profile });
       return;
     }
-    if (type === "take_seat") { room.addPlayer(profile); await store.save(profile, accounts); broadcast(room); return; }
+    if (type === "take_seat") { room.addPlayer(profile); broadcast(room); return; }
     if (type === "become_spectator") { room.becomeSpectator(profile.id); await saveRoomProfiles(room); broadcast(room); return; }
     if (!room.players.has(profile.id)) throw Error("You are spectating this round");
     if (room.game === "roulette") {
@@ -310,7 +363,7 @@ wss.on("connection", (ws, request) => {
     else if (type === "bet") room.placeBet(profile.id, Number(message.amount));
     else if (type === "ready") room.readyPlayer(profile.id);
     else if (type === "unready") room.unreadyPlayer(profile.id);
-    else if (type === "start") room.startIfReady(); else if (type === "hit") room.hit(profile.id); else if (type === "stand") room.stand(profile.id); else if (type === "dealer_hit") room.dealerHit(profile.id); else if (type === "dealer_stand") room.dealerStand(profile.id); else if (type === "double") room.double(profile.id); else if (type === "split") room.split(profile.id); else if (type === "surrender") room.surrender(profile.id); else if (type === "next_round") room.nextRound(); else if (type === "become_dealer") room.setDealer(profile.id); else if (type === "leave_dealer") room.removeDealer(profile.id); else throw Error("Unknown action");
+    else if (type === "start") room.startIfReady(); else if (type === "hit") room.hit(profile.id); else if (type === "stand") room.stand(profile.id); else if (type === "dealer_hit") room.dealerHit(profile.id); else if (type === "dealer_stand") room.dealerStand(profile.id); else if (type === "double") room.double(profile.id); else if (type === "split") room.split(profile.id); else if (type === "surrender") room.surrender(profile.id); else if (type === "next_round") room.nextRound(); else if (type === "become_dealer") room.setDealer(profile.id); else if (type === "leave_dealer") room.removeDealer(profile.id); else if (type === "leave_dealer_queue") room.cancelDealerRequest(profile.id); else throw Error("Unknown action");
     await saveRoomProfiles(room); broadcast(room);
     if (room.phase !== phaseBeforeAction) broadcastRoomList();
   } catch (error) {

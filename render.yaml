@@ -33,3 +33,9 @@ services:
         value: "40"
       - key: STATE_ACTION_LIMIT_PER_10S
         value: "15"
+      - key: ALLOW_SIMULATED_REWARDED_GRANT
+        value: "true"
+      - key: REWARDED_GRANT_DAILY_LIMIT
+        value: "100"
+      - key: REWARDED_GRANT_COOLDOWN_MS
+        value: "0"
