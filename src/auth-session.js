@@ -7,7 +7,7 @@ const defaultRotationGraceMilliseconds = readIntegerSetting("SESSION_ROTATION_GR
 export const sessionTokenHash = token => crypto.createHash("sha256").update(token).digest("hex");
 export const newSessionToken = () => crypto.randomBytes(32).toString("base64url");
 
-const tokenMatches = (token, expectedHash) => {
+export const tokenMatches = (token, expectedHash) => {
   if (!token || !expectedHash) return false;
   const actual = Buffer.from(sessionTokenHash(String(token)), "hex");
   const expected = Buffer.from(expectedHash, "hex");
@@ -43,4 +43,3 @@ export const rotatedAuthRecord = ({
   previousSessionTokenHash: presentedHash,
   previousSessionExpiresAt: presentedHash ? new Date(now.getTime() + graceMilliseconds).toISOString() : null,
 });
-

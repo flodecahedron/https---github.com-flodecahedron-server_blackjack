@@ -7,7 +7,7 @@ import { RouletteRoom } from "./roulette-room.js";
 import { PlayerStore } from "./player-store.js";
 import { FixedWindowRateLimiter, fingerprintAddress, getClientAddress, readIntegerSetting } from "./security.js";
 import { isGoogleAuthConfigured, verifyGoogleIdToken } from "./google-auth.js";
-import { newSessionToken, rotatedAuthRecord, sessionCredentialHash } from "./auth-session.js";
+import { newSessionToken, rotatedAuthRecord, sessionCredentialHash, sessionTokenHash, tokenMatches } from "./auth-session.js";
 
 const accounts = new Map(), rooms = new Map(), sockets = new Map(), store = new PlayerStore();
 const authByPlayer = new Map(), playerByGoogleSubject = new Map();
@@ -167,6 +167,7 @@ wss.on("connection", (ws, request) => {
   let connectionReleased = false;
   let googleNonce = null;
   let googleNonceExpiresAt = 0;
+  let pendingGoogleConfirmation = null;
   console.log(`[socket] Client connected (${addressFingerprint.slice(0, 12)})`);
   ws.on("message", async raw => { try {
     const ipTrafficKey = `ip:${addressFingerprint}`;
@@ -191,8 +192,12 @@ wss.on("connection", (ws, request) => {
       ws.close(1008, "Action rate limit");
       return;
     }
+    // The Android Google account picker temporarily backgrounds the app. Its
+    // resume health check can arrive while the ID token is still being verified.
+    if (type === "ping") { send(ws, "pong", {}); return; }
     if (type === "request_google_auth") {
       if (!isGoogleAuthConfigured()) throw Error("Connexion Google non configurée sur le serveur");
+      pendingGoogleConfirmation = null;
       googleNonce = crypto.randomBytes(32).toString("base64url");
       googleNonceExpiresAt = Date.now() + 2 * 60 * 1000;
       send(ws, "google_auth_nonce", { nonce: googleNonce });
@@ -203,6 +208,7 @@ wss.on("connection", (ws, request) => {
       const identity = await verifyGoogleIdToken(message.idToken, googleNonce);
       googleNonce = null;
       googleNonceExpiresAt = 0;
+      const authIntent = message.intent === "signup" ? "signup" : "login";
 
       const linkedPlayerId = playerByGoogleSubject.get(identity.sub);
       let googleProfile = linkedPlayerId ? accounts.get(linkedPlayerId) : null;
@@ -212,9 +218,20 @@ wss.on("connection", (ws, request) => {
         if (existingAuth?.googleSub && existingAuth.googleSub !== identity.sub) throw Error("Ce joueur est déjà associé à un autre compte Google");
         googleProfile = profile;
       }
+      if (authIntent === "signup" && googleProfile) {
+        const confirmationToken = newSessionToken();
+        pendingGoogleConfirmation = {
+          playerId: googleProfile.id,
+          googleSub: identity.sub,
+          tokenHash: sessionTokenHash(confirmationToken),
+          expiresAt: Date.now() + 2 * 60 * 1000,
+        };
+        send(ws, "google_account_exists", { username: googleProfile.username, confirmationToken });
+        return;
+      }
       if (!googleProfile) {
         const username = String(message.username ?? "").trim();
-        if (!username) throw Error("Aucun compte lié à ce compte Google. Créez un compte et choisissez un pseudo.");
+        if (authIntent !== "signup") throw Error("Aucun compte lié à ce compte Google. Créez un compte et choisissez un pseudo.");
         if (!/^[\w-]{3,16}$/.test(username)) throw Error("Choisissez un pseudo de 3 à 16 caractères");
         if ([...accounts.values()].some(account => account.username.toLowerCase() === username.toLowerCase())) throw Error("Pseudo déjà utilisé");
         if (!await store.consumeQuota(addressFingerprint, "register", registrationIpLimit, persistentQuotaWindow)) throw Error("Trop de comptes ont été créés depuis ce réseau aujourd'hui");
@@ -223,6 +240,7 @@ wss.on("connection", (ws, request) => {
         await store.save(googleProfile, accounts);
       }
 
+      pendingGoogleConfirmation = null;
       const issuedToken = newSessionToken();
       const authRecord = rotatedAuthRecord({
         playerId: googleProfile.id,
@@ -235,6 +253,29 @@ wss.on("connection", (ws, request) => {
       profile = googleProfile;
       const dailyGift = await finishAuthentication(ws, profile, issuedToken);
       console.log(`[player] ${profile.username} authenticated with Google`);
+      if (dailyGift.amount > 0) console.log(`[reward] ${profile.username} received ${dailyGift.amount} daily chips`);
+      return;
+    }
+    if (type === "confirm_google_login") {
+      const confirmationToken = String(message.confirmationToken ?? "");
+      const pending = pendingGoogleConfirmation;
+      if (!pending || Date.now() > pending.expiresAt || !tokenMatches(confirmationToken, pending.tokenHash)) {
+        pendingGoogleConfirmation = null;
+        throw Error("Cette confirmation Google a expiré. Recommencez la connexion.");
+      }
+      const googleProfile = accounts.get(pending.playerId);
+      if (!googleProfile || playerByGoogleSubject.get(pending.googleSub) !== googleProfile.id) {
+        pendingGoogleConfirmation = null;
+        throw Error("Le compte Google associé n'est plus disponible");
+      }
+      pendingGoogleConfirmation = null;
+      const issuedToken = newSessionToken();
+      const authRecord = rotatedAuthRecord({ playerId: googleProfile.id, googleSub: pending.googleSub, issuedToken });
+      await store.saveAuthAccount(authRecord);
+      authByPlayer.set(googleProfile.id, authRecord);
+      profile = googleProfile;
+      const dailyGift = await finishAuthentication(ws, profile, issuedToken);
+      console.log(`[player] ${profile.username} confirmed loading their existing Google account`);
       if (dailyGift.amount > 0) console.log(`[reward] ${profile.username} received ${dailyGift.amount} daily chips`);
       return;
     }
@@ -291,7 +332,6 @@ wss.on("connection", (ws, request) => {
       }
     }
     if (!profile) throw Error("Authentication required");
-    if (type === "ping") { send(ws, "pong", {}); return; }
     if (type === "list_rooms") { sendRoomList(ws); return; }
     if (type === "get_leaderboard") { sendLeaderboard(ws); return; }
     if (type === "get_daily_roulette") { send(ws, "daily_roulette_status", { roulette: dailyRouletteStatus(profile) }); return; }
