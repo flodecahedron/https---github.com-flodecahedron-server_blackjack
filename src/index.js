@@ -7,6 +7,7 @@ import { RouletteRoom } from "./roulette-room.js";
 import { PlayerStore } from "./player-store.js";
 import { FixedWindowRateLimiter, fingerprintAddress, getClientAddress, readIntegerSetting } from "./security.js";
 import { isGoogleAuthConfigured, verifyGoogleIdToken } from "./google-auth.js";
+import { newSessionToken, rotatedAuthRecord, sessionCredentialHash } from "./auth-session.js";
 
 const accounts = new Map(), rooms = new Map(), sockets = new Map(), store = new PlayerStore();
 const authByPlayer = new Map(), playerByGoogleSubject = new Map();
@@ -27,17 +28,10 @@ const STATE_CHANGING_ACTIONS = new Set([
   "roulette_bet", "roulette_clear_bets", "ready", "unready", "bet", "start", "hit", "stand", "dealer_hit",
   "dealer_stand", "double", "split", "surrender", "next_round", "become_dealer", "leave_dealer", "leave_dealer_queue",
   "claim_safety_grant",
+  "logout", "delete_account",
 ]);
 const ROOM_CODES = ["ABLE", "BAKE", "BIRD", "BLUE", "BOLD", "CALM", "DARK", "DOVE", "EAST", "FIRE", "GOLD", "HILL", "JUMP", "LIME", "MOON", "ROSE", "SAND", "STAR", "WAVE", "WIND"];
 const id = () => crypto.randomUUID();
-const sessionTokenHash = token => crypto.createHash("sha256").update(token).digest("hex");
-const newSessionToken = () => crypto.randomBytes(32).toString("base64url");
-const sessionTokenMatches = (token, expectedHash) => {
-  if (!token || !expectedHash) return false;
-  const actual = Buffer.from(sessionTokenHash(String(token)), "hex");
-  const expected = Buffer.from(expectedHash, "hex");
-  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
-};
 const send = (ws, type, payload) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ type, ...payload }));
 const fail = (ws, message) => send(ws, "error", { message });
 const roomSummary = room => ({
@@ -229,7 +223,11 @@ wss.on("connection", (ws, request) => {
       }
 
       const issuedToken = newSessionToken();
-      const authRecord = { playerId: googleProfile.id, googleSub: identity.sub, email: identity.email, sessionTokenHash: sessionTokenHash(issuedToken) };
+      const authRecord = rotatedAuthRecord({
+        playerId: googleProfile.id,
+        googleSub: identity.sub,
+        issuedToken,
+      });
       await store.saveAuthAccount(authRecord);
       authByPlayer.set(googleProfile.id, authRecord);
       playerByGoogleSubject.set(identity.sub, googleProfile.id);
@@ -251,7 +249,7 @@ wss.on("connection", (ws, request) => {
       profile = { id: id(), username, avatar: String(message.avatar ?? ""), balance: 1000, loginStreak: 0, lastLogin: null, lastRoulette: null };
       accounts.set(profile.id, profile);
       const issuedToken = newSessionToken();
-      const authRecord = { playerId: profile.id, googleSub: null, email: null, sessionTokenHash: sessionTokenHash(issuedToken) };
+      const authRecord = rotatedAuthRecord({ playerId: profile.id, googleSub: null, issuedToken });
       await store.save(profile, accounts);
       await store.saveAuthAccount(authRecord);
       authByPlayer.set(profile.id, authRecord);
@@ -264,11 +262,25 @@ wss.on("connection", (ws, request) => {
       if (!loginProfile) throw Error("Compte introuvable");
       let authRecord = authByPlayer.get(loginProfile.id);
       if (authRecord) {
-        if (!sessionTokenMatches(message.sessionToken, authRecord.sessionTokenHash)) throw Error("Session expirée : reconnectez-vous avec Google");
+        const presentedHash = sessionCredentialHash(authRecord, message.sessionToken);
+        if (!presentedHash) throw Error("Session expirée : reconnectez-vous avec Google");
+        const issuedToken = newSessionToken();
+        authRecord = rotatedAuthRecord({
+          playerId: loginProfile.id,
+          googleSub: authRecord.googleSub,
+          presentedHash,
+          issuedToken,
+        });
+        await store.saveAuthAccount(authRecord);
+        authByPlayer.set(loginProfile.id, authRecord);
+        profile = loginProfile;
+        await finishAuthentication(ws, profile, issuedToken);
+        console.log(`[player] ${profile.username} connected with a rotated session`);
+        return;
       } else {
         if (!allowGuestAuth) throw Error("Reconnectez-vous avec Google");
         const issuedToken = newSessionToken();
-        authRecord = { playerId: loginProfile.id, googleSub: null, email: null, sessionTokenHash: sessionTokenHash(issuedToken) };
+        authRecord = rotatedAuthRecord({ playerId: loginProfile.id, googleSub: null, issuedToken });
         await store.saveAuthAccount(authRecord);
         authByPlayer.set(loginProfile.id, authRecord);
         profile = loginProfile;
@@ -276,10 +288,6 @@ wss.on("connection", (ws, request) => {
         console.log(`[player] ${profile.username} upgraded to a secured local session`);
         return;
       }
-      profile = loginProfile;
-      await finishAuthentication(ws, profile);
-      console.log(`[player] ${profile.username} connected`);
-      return;
     }
     if (!profile) throw Error("Authentication required");
     if (type === "ping") { send(ws, "pong", {}); return; }
@@ -287,6 +295,39 @@ wss.on("connection", (ws, request) => {
     if (type === "get_leaderboard") { sendLeaderboard(ws); return; }
     if (type === "get_daily_roulette") { send(ws, "daily_roulette_status", { roulette: dailyRouletteStatus(profile) }); return; }
     if (type === "get_safety_grant") { send(ws, "safety_grant_status", { safetyGrant: store.safetyGrantStatus(profile), profile }); return; }
+    if (type === "logout") {
+      const departingProfile = profile;
+      const activeRoom = currentRoomFor(departingProfile.id);
+      if (activeRoom) await removeFromRoom(activeRoom, departingProfile);
+      await store.revokeAuthSession(departingProfile.id);
+      const authRecord = authByPlayer.get(departingProfile.id);
+      if (authRecord) {
+        authRecord.sessionRevokedAt = new Date().toISOString();
+        authRecord.previousSessionTokenHash = null;
+        authRecord.previousSessionExpiresAt = null;
+      }
+      sockets.delete(departingProfile.id);
+      profile = null;
+      send(ws, "logged_out", {});
+      console.log(`[player] ${departingProfile.username} logged out`);
+      return;
+    }
+    if (type === "delete_account") {
+      const deletedProfile = profile;
+      const activeRoom = currentRoomFor(deletedProfile.id);
+      if (activeRoom) await removeFromRoom(activeRoom, deletedProfile);
+      const authRecord = authByPlayer.get(deletedProfile.id);
+      await store.deletePlayer(deletedProfile.id, accounts);
+      authByPlayer.delete(deletedProfile.id);
+      if (authRecord?.googleSub && playerByGoogleSubject.get(authRecord.googleSub) === deletedProfile.id) playerByGoogleSubject.delete(authRecord.googleSub);
+      sockets.delete(deletedProfile.id);
+      profile = null;
+      send(ws, "account_deleted", {});
+      broadcastRoomList();
+      for (const clientSocket of sockets.values()) sendLeaderboard(clientSocket);
+      console.log(`[player] ${deletedProfile.username} deleted their account`);
+      return;
+    }
     if (type === "claim_safety_grant") {
       const grantRoom = currentRoomFor(profile.id);
       const grantPlayer = grantRoom?.players.get(profile.id);

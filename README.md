@@ -56,4 +56,8 @@ L'APK utilise le paquet définitif `com.bedealer.game`, un export Gradle et un p
 
 Le serveur vérifie la signature, l'audience, l'expiration et le nonce de l'ID token, puis utilise le champ Google `sub` comme identité stable. Aucun secret OAuth Web n'est requis dans l'APK ou sur Render.
 
+Les sessions applicatives sont hachées en base, expirent après 90 jours et sont renouvelées à chaque restauration réussie. L'ancien jeton reste valable cinq minutes uniquement pour absorber une réponse perdue pendant la rotation. Une déconnexion révoque immédiatement la session. La suppression de compte efface le profil, le journal financier et la liaison Google par cascade SQL. L'adresse e-mail Google n'est ni utilisée ni stockée ; la migration vide les anciennes valeurs tout en conservant temporairement la colonne vide pour permettre un rollback Render sûr.
+
+Le serveur de production utilise Node.js 24, fixé par `package.json`, `.node-version` et `NODE_VERSION` dans le Blueprint Render. Les durées sont configurables avec `SESSION_TTL_DAYS` et `SESSION_ROTATION_GRACE_MINUTES`.
+
 Pour rendre les bots sensiblement plus difficiles que par la seule connexion Google, valider aussi un jeton **Google Play Integrity** côté serveur lors de la création du compte et des actions à forte valeur. Google Sign-In empêche l'usurpation d'un compte quand l'ID token est vérifié, mais ne garantit pas à lui seul qu'un humain n'automatise pas plusieurs comptes Google.

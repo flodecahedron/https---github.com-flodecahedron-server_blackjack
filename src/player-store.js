@@ -199,13 +199,34 @@ export class PlayerStore {
 
   async loadAuthAccounts() {
     if (this.pool) {
-      const { rows } = await this.pool.query("SELECT player_id, google_sub, email, session_token_hash FROM blackjack_auth_accounts");
-      return rows.map(row => ({ playerId: row.player_id, googleSub: row.google_sub, email: row.email, sessionTokenHash: row.session_token_hash }));
+      const { rows } = await this.pool.query("SELECT player_id, google_sub, session_token_hash, session_expires_at, session_last_used_at, session_revoked_at, previous_session_token_hash, previous_session_expires_at FROM blackjack_auth_accounts");
+      return rows.map(row => ({
+        playerId: row.player_id,
+        googleSub: row.google_sub,
+        sessionTokenHash: row.session_token_hash,
+        sessionExpiresAt: row.session_expires_at?.toISOString() ?? null,
+        sessionLastUsedAt: row.session_last_used_at?.toISOString() ?? null,
+        sessionRevokedAt: row.session_revoked_at?.toISOString() ?? null,
+        previousSessionTokenHash: row.previous_session_token_hash,
+        previousSessionExpiresAt: row.previous_session_expires_at?.toISOString() ?? null,
+      }));
     }
     try {
       const records = JSON.parse(await readFile(this.authFilePath, "utf8"));
-      this.localAuthAccounts = new Map(records.map(record => [record.playerId, record]));
-      return records;
+      const defaultExpiry = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
+      const normalizedRecords = records.map(record => ({
+        playerId: record.playerId,
+        googleSub: record.googleSub ?? null,
+        sessionTokenHash: record.sessionTokenHash,
+        sessionExpiresAt: record.sessionExpiresAt ?? defaultExpiry,
+        sessionLastUsedAt: record.sessionLastUsedAt ?? new Date().toISOString(),
+        sessionRevokedAt: record.sessionRevokedAt ?? null,
+        previousSessionTokenHash: record.previousSessionTokenHash ?? null,
+        previousSessionExpiresAt: record.previousSessionExpiresAt ?? null,
+      }));
+      this.localAuthAccounts = new Map(normalizedRecords.map(record => [record.playerId, record]));
+      if (records.some(record => "email" in record || !record.sessionExpiresAt)) await this.writeLocalAuthAccounts();
+      return normalizedRecords;
     } catch (error) {
       if (error.code === "ENOENT") return [];
       throw error;
@@ -215,12 +236,46 @@ export class PlayerStore {
   async saveAuthAccount(record) {
     if (this.pool) {
       await this.pool.query(
-        "INSERT INTO blackjack_auth_accounts (player_id, google_sub, email, session_token_hash) VALUES ($1,$2,$3,$4) ON CONFLICT (player_id) DO UPDATE SET google_sub=EXCLUDED.google_sub, email=EXCLUDED.email, session_token_hash=EXCLUDED.session_token_hash, updated_at=NOW()",
-        [record.playerId, record.googleSub ?? null, record.email ?? null, record.sessionTokenHash],
+        "INSERT INTO blackjack_auth_accounts (player_id, google_sub, session_token_hash, session_expires_at, session_last_used_at, session_revoked_at, previous_session_token_hash, previous_session_expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (player_id) DO UPDATE SET google_sub=EXCLUDED.google_sub, session_token_hash=EXCLUDED.session_token_hash, session_expires_at=EXCLUDED.session_expires_at, session_last_used_at=EXCLUDED.session_last_used_at, session_revoked_at=EXCLUDED.session_revoked_at, previous_session_token_hash=EXCLUDED.previous_session_token_hash, previous_session_expires_at=EXCLUDED.previous_session_expires_at, updated_at=NOW()",
+        [record.playerId, record.googleSub ?? null, record.sessionTokenHash, record.sessionExpiresAt, record.sessionLastUsedAt, record.sessionRevokedAt ?? null, record.previousSessionTokenHash ?? null, record.previousSessionExpiresAt ?? null],
       );
       return;
     }
     this.localAuthAccounts.set(record.playerId, record);
+    await this.writeLocalAuthAccounts();
+  }
+
+  async revokeAuthSession(playerId) {
+    if (this.pool) {
+      await this.pool.query(
+        "UPDATE blackjack_auth_accounts SET session_revoked_at=NOW(), previous_session_token_hash=NULL, previous_session_expires_at=NULL, updated_at=NOW() WHERE player_id=$1",
+        [playerId],
+      );
+      return;
+    }
+    const record = this.localAuthAccounts.get(playerId);
+    if (!record) return;
+    record.sessionRevokedAt = new Date().toISOString();
+    record.previousSessionTokenHash = null;
+    record.previousSessionExpiresAt = null;
+    await this.writeLocalAuthAccounts();
+  }
+
+  async deletePlayer(playerId, accounts) {
+    if (this.pool) {
+      await this.pool.query("DELETE FROM blackjack_players WHERE id=$1", [playerId]);
+      accounts.delete(playerId);
+      return;
+    }
+    accounts.delete(playerId);
+    this.localAuthAccounts.delete(playerId);
+    const temporaryPlayers = `${this.filePath}.tmp`;
+    await writeFile(temporaryPlayers, JSON.stringify([...accounts.values()], null, 2));
+    await rename(temporaryPlayers, this.filePath);
+    await this.writeLocalAuthAccounts();
+  }
+
+  async writeLocalAuthAccounts() {
     const temporary = `${this.authFilePath}.tmp`;
     await writeFile(temporary, JSON.stringify([...this.localAuthAccounts.values()], null, 2));
     await rename(temporary, this.authFilePath);

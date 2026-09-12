@@ -18,8 +18,5 @@ export async function verifyGoogleIdToken(idToken, expectedNonce) {
   const payload = ticket.getPayload();
   if (!payload?.sub) throw Error("Identité Google invalide");
   if (payload.nonce !== expectedNonce) throw Error("Tentative de connexion Google expirée");
-  return {
-    sub: payload.sub,
-    email: payload.email_verified ? payload.email ?? null : null,
-  };
+  return { sub: payload.sub };
 }
