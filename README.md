@@ -41,10 +41,21 @@ Les contrôles importants sont côté serveur :
 - aucune adresse IP brute stockée : seul un HMAC non réversible est conservé grâce à `ABUSE_HASH_SECRET` ;
 - la liste complète des rooms n'est plus rediffusée après chaque jeton misé.
 - un compte ne peut plus multiplier les diffusions en restant présent dans plusieurs rooms.
+- une room envoie un snapshot à l'entrée, puis uniquement des opérations différentielles versionnées ;
+- le classement SQL ne renvoie que le top 3, le rang du joueur ou une page de 25 profils ;
+- la liste complète des comptes n'est jamais envoyée à un client.
 
 `ABUSE_HASH_SECRET` est obligatoire avec PostgreSQL. Le Blueprint génère automatiquement un secret de 256 bits. Ne jamais le publier ni le modifier, faute de quoi l'identifiant pseudonymisé d'un même réseau changerait.
 
 Ces valeurs sont volontairement adaptées à un petit cercle de joueurs. Une famille ou une école derrière la même adresse publique partage les quotas ; augmentez-les dans Render si nécessaire.
+
+## Suivi de la bande passante
+
+`TRAFFIC_METRICS_INTERVAL_SECONDS=300` produit toutes les cinq minutes une ligne Render préfixée par `[traffic]`. Elle contient les octets et le nombre de messages entrants/sortants, ventilés par type (`room_snapshot`, `room_delta`, `leaderboard_page`, etc.). Les compteurs sont agrégés en mémoire puis remis à zéro après chaque rapport ; aucune donnée joueur n'est journalisée.
+
+`LOG_WS_MESSAGES=false` désactive en production la ligne de log de chaque message WebSocket. Les connexions, erreurs, alertes de sécurité et rapports de trafic restent visibles. Réactiver temporairement cette variable uniquement pour diagnostiquer un problème précis.
+
+Le protocole réseau courant est la version 2. Il ne maintient volontairement pas la compatibilité des anciens APK : publier le nouvel APK en même temps que ce serveur. Le client anime les cartes et les jetons localement à partir des changements de données ; le serveur reste autoritaire sur les cartes, mises, résultats et soldes.
 
 ## Développement local
 
@@ -61,3 +72,17 @@ Les sessions applicatives sont hachées en base, expirent après 90 jours et son
 Le serveur de production utilise Node.js 24, fixé par `package.json`, `.node-version` et `NODE_VERSION` dans le Blueprint Render. Les durées sont configurables avec `SESSION_TTL_DAYS` et `SESSION_ROTATION_GRACE_MINUTES`.
 
 Pour rendre les bots sensiblement plus difficiles que par la seule connexion Google, valider aussi un jeton **Google Play Integrity** côté serveur lors de la création du compte et des actions à forte valeur. Google Sign-In empêche l'usurpation d'un compte quand l'ID token est vérifié, mais ne garantit pas à lui seul qu'un humain n'automatise pas plusieurs comptes Google.
+
+## Google Play Integrity
+
+Le plugin Android prépare un fournisseur de jetons Play Integrity standard et répond au défi envoyé après chaque authentification. Le serveur transmet le jeton chiffré à Google, puis contrôle le `requestHash`, l'âge de la requête, le paquet `com.bedealer.game`, `PLAY_RECOGNIZED`, `MEETS_DEVICE_INTEGRITY` et, en production Play, `LICENSED`. Une attestation acceptée reste valable 30 minutes sur la connexion WebSocket courante.
+
+Configuration nécessaire :
+
+1. Dans la Play Console, créer l'application `com.bedealer.game`, lier le projet Google Cloud `92573100008` et activer Play Integrity API.
+2. Créer un compte de service dans ce même projet, lui donner l'accès nécessaire à Play Integrity, puis placer la totalité de sa clé JSON dans le secret Render `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON`.
+3. Déployer d'abord avec `PLAY_INTEGRITY_MODE=audit`. Les verdicts apparaissent dans les logs sous `[integrity]` mais ne bloquent personne.
+4. Distribuer une version par une piste de test Google Play et vérifier des verdicts `verified` sur plusieurs téléphones.
+5. Passer ensuite `PLAY_INTEGRITY_MODE=enforce`. Les actions de jeu qui modifient l'état sont alors refusées aux clients non attestés, tandis que quitter une table, se déconnecter et supprimer son compte restent toujours possibles.
+
+Ne jamais activer `enforce` avant la distribution par Google Play : une APK installée directement est normalement `UNLICENSED` ou `UNRECOGNIZED_VERSION`. La clé du compte de service ne doit jamais être incluse dans l'APK ou le dépôt Git.

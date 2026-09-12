@@ -33,6 +33,87 @@ export class PlayerStore {
     }
     try { return JSON.parse(await readFile(this.filePath, "utf8")); } catch (error) { if (error.code === "ENOENT") return []; throw error; }
   }
+
+  async leaderboardSummary(playerId, accounts) {
+    if (this.pool) {
+      const { rows } = await this.pool.query(
+        `WITH ranked AS (
+          SELECT id, username, balance,
+            ROW_NUMBER() OVER (ORDER BY balance DESC, username ASC, id ASC)::INTEGER AS rank,
+            COUNT(*) OVER ()::INTEGER AS total
+          FROM blackjack_players
+        )
+        SELECT id, username, balance, rank, total
+        FROM ranked
+        WHERE rank <= 3 OR id = $1
+        ORDER BY rank`,
+        [playerId],
+      );
+      const entries = rows.map(row => ({ rank: row.rank, username: row.username, balance: row.balance }));
+      const viewerRow = rows.find(row => row.id === playerId);
+      return {
+        top: entries.filter(entry => entry.rank <= 3),
+        viewer: viewerRow ? { rank: viewerRow.rank, username: viewerRow.username, balance: viewerRow.balance } : null,
+        total: rows[0]?.total ?? 0,
+      };
+    }
+    const entries = this.localLeaderboard(accounts);
+    const publicEntry = entry => entry ? ({ rank: entry.rank, username: entry.username, balance: entry.balance }) : null;
+    return {
+      top: entries.slice(0, 3).map(publicEntry),
+      viewer: publicEntry(entries.find(entry => entry.id === playerId)),
+      total: entries.length,
+    };
+  }
+
+  async leaderboardPage(playerId, requestedPage, accounts, pageSize = 25) {
+    const normalizedSize = Math.max(1, Math.min(25, Number.parseInt(pageSize, 10) || 25));
+    if (this.pool) {
+      const countResult = await this.pool.query("SELECT COUNT(*)::INTEGER AS total FROM blackjack_players");
+      const total = countResult.rows[0]?.total ?? 0;
+      const totalPages = Math.max(1, Math.ceil(total / normalizedSize));
+      const page = Math.max(0, Math.min(Number.parseInt(requestedPage, 10) || 0, totalPages - 1));
+      const offset = page * normalizedSize;
+      const { rows } = await this.pool.query(
+        `WITH ranked AS (
+          SELECT id, username, balance,
+            ROW_NUMBER() OVER (ORDER BY balance DESC, username ASC, id ASC)::INTEGER AS rank
+          FROM blackjack_players
+        )
+        SELECT id, username, balance, rank
+        FROM ranked
+        ORDER BY rank
+        LIMIT $1 OFFSET $2`,
+        [normalizedSize, offset],
+      );
+      return {
+        players: rows.map(row => ({ rank: row.rank, username: row.username, balance: row.balance })),
+        page,
+        pageSize: normalizedSize,
+        total,
+        totalPages,
+        viewerRank: rows.find(row => row.id === playerId)?.rank ?? null,
+      };
+    }
+    const entries = this.localLeaderboard(accounts);
+    const totalPages = Math.max(1, Math.ceil(entries.length / normalizedSize));
+    const page = Math.max(0, Math.min(Number.parseInt(requestedPage, 10) || 0, totalPages - 1));
+    return {
+      players: entries.slice(page * normalizedSize, (page + 1) * normalizedSize)
+        .map(({ rank, username, balance }) => ({ rank, username, balance })),
+      page,
+      pageSize: normalizedSize,
+      total: entries.length,
+      totalPages,
+      viewerRank: entries.find(entry => entry.id === playerId)?.rank ?? null,
+    };
+  }
+
+  localLeaderboard(accounts) {
+    return [...accounts.values()]
+      .sort((left, right) => right.balance - left.balance || left.username.localeCompare(right.username) || left.id.localeCompare(right.id))
+      .map((player, index) => ({ id: player.id, rank: index + 1, username: player.username, balance: player.balance }));
+  }
   async save(profile, accounts) {
     if (this.pool) {
       await this.pool.query("INSERT INTO blackjack_players (id, username, avatar, balance, login_streak, last_login, last_roulette, last_safety_grant, rewarded_grant_date, rewarded_grant_count, last_rewarded_grant_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO UPDATE SET avatar=EXCLUDED.avatar, balance=EXCLUDED.balance, login_streak=EXCLUDED.login_streak, last_login=EXCLUDED.last_login, last_roulette=EXCLUDED.last_roulette, last_safety_grant=EXCLUDED.last_safety_grant, rewarded_grant_date=EXCLUDED.rewarded_grant_date, rewarded_grant_count=EXCLUDED.rewarded_grant_count, last_rewarded_grant_at=EXCLUDED.last_rewarded_grant_at", [profile.id, profile.username, profile.avatar, profile.balance, profile.loginStreak, profile.lastLogin, profile.lastRoulette ?? null, profile.lastSafetyGrant ?? null, profile.rewardedGrantDate ?? null, profile.rewardedGrantCount ?? 0, profile.lastRewardedGrantAt ?? null]);

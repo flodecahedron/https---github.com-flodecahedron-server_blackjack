@@ -5,9 +5,19 @@ import { DAILY_ROULETTE_SEGMENTS, claimDailyRoulette, dailyReward, dailyRoulette
 import { GameRoom } from "./game-room.js";
 import { RouletteRoom } from "./roulette-room.js";
 import { PlayerStore } from "./player-store.js";
+import { createRoomDelta } from "./room-delta.js";
+import { TrafficMetrics } from "./traffic-metrics.js";
 import { FixedWindowRateLimiter, fingerprintAddress, getClientAddress, readIntegerSetting } from "./security.js";
 import { isGoogleAuthConfigured, verifyGoogleIdToken } from "./google-auth.js";
 import { newSessionToken, rotatedAuthRecord, sessionCredentialHash, sessionTokenHash, tokenMatches } from "./auth-session.js";
+import {
+  PLAY_INTEGRITY_MODE,
+  PLAY_INTEGRITY_PROJECT_NUMBER,
+  PLAY_INTEGRITY_VERIFIED_TTL_MS,
+  createIntegrityChallenge,
+  decodeAndAssessIntegrityToken,
+  isPlayIntegrityConfigured,
+} from "./play-integrity.js";
 
 const accounts = new Map(), rooms = new Map(), sockets = new Map(), store = new PlayerStore();
 const authByPlayer = new Map(), playerByGoogleSubject = new Map();
@@ -21,6 +31,9 @@ const messageLimitPerTenSeconds = readIntegerSetting("MESSAGE_LIMIT_PER_10S", 40
 const stateActionLimitPerTenSeconds = readIntegerSetting("STATE_ACTION_LIMIT_PER_10S", 15, 5, 100);
 const connectionCounts = new Map();
 const trafficLimiter = new FixedWindowRateLimiter();
+const trafficMetrics = new TrafficMetrics({ intervalSeconds: readIntegerSetting("TRAFFIC_METRICS_INTERVAL_SECONDS", 300, 0, 86_400) });
+const logWebSocketMessages = String(process.env.LOG_WS_MESSAGES ?? (process.env.NODE_ENV === "production" ? "false" : "true")).toLowerCase() === "true";
+const deliveredRoomStates = new WeakMap();
 const persistentQuotaWindow = 24 * 60 * 60 * 1000;
 const allowGuestAuth = String(process.env.ALLOW_GUEST_AUTH ?? "true").toLowerCase() === "true";
 const STATE_CHANGING_ACTIONS = new Set([
@@ -30,9 +43,16 @@ const STATE_CHANGING_ACTIONS = new Set([
   "claim_safety_grant",
   "logout", "delete_account",
 ]);
+const INTEGRITY_BYPASS_ACTIONS = new Set(["leave_room", "become_spectator", "leave_dealer", "leave_dealer_queue", "logout", "delete_account"]);
 const ROOM_CODES = ["ABLE", "BAKE", "BIRD", "BLUE", "BOLD", "CALM", "DARK", "DOVE", "EAST", "FIRE", "GOLD", "HILL", "JUMP", "LIME", "MOON", "ROSE", "SAND", "STAR", "WAVE", "WIND"];
 const id = () => crypto.randomUUID();
-const send = (ws, type, payload) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ type, ...payload }));
+const send = (ws, type, payload) => {
+  if (ws.readyState !== ws.OPEN) return false;
+  const serialized = JSON.stringify({ type, ...payload });
+  trafficMetrics.recordOutbound(type, serialized);
+  ws.send(serialized);
+  return true;
+};
 const fail = (ws, message) => send(ws, "error", { message });
 const roomSummary = room => ({
   game: room.game ?? "blackjack",
@@ -46,16 +66,44 @@ const roomSummary = room => ({
 });
 const sendRoomList = ws => send(ws, "room_list", { rooms: [...rooms.values()].map(roomSummary).sort((a, b) => a.code.localeCompare(b.code)) });
 const broadcastRoomList = () => { for (const ws of sockets.values()) sendRoomList(ws); };
-const leaderboardEntries = () => [...accounts.values()]
-  .sort((left, right) => right.balance - left.balance || left.username.localeCompare(right.username))
-  .map((player, index) => ({ rank: index + 1, username: player.username, balance: player.balance }));
-const sendLeaderboard = ws => send(ws, "leaderboard", { players: leaderboardEntries() });
+const sendLeaderboardSummary = async (ws, playerId) => {
+  const summary = await store.leaderboardSummary(playerId, accounts);
+  send(ws, "leaderboard_summary", summary);
+};
+const sendLeaderboardPage = async (ws, playerId, page) => {
+  const result = await store.leaderboardPage(playerId, page, accounts, 25);
+  send(ws, "leaderboard_page", result);
+};
 const roomCode = () => {
   const available = ROOM_CODES.filter(code => !rooms.has(code));
   if (!available.length) throw Error("Toutes les tables sont occupées");
   return available[crypto.randomInt(available.length)];
 };
-const broadcast = room => { for (const playerId of [...room.players.keys(), ...room.spectators.keys()]) if (sockets.has(playerId)) send(sockets.get(playerId), "room_state", { room: room.publicState(playerId) }); };
+const sendRoomSnapshot = (room, playerId, ws) => {
+  const state = structuredClone(room.publicState(playerId));
+  const version = (deliveredRoomStates.get(ws)?.version ?? 0) + 1;
+  deliveredRoomStates.set(ws, { code: room.code, version, state });
+  send(ws, "room_snapshot", { room: state, version });
+};
+const sendRoomUpdate = (room, playerId, ws) => {
+  const previous = deliveredRoomStates.get(ws);
+  if (!previous || previous.code !== room.code) {
+    sendRoomSnapshot(room, playerId, ws);
+    return;
+  }
+  const state = structuredClone(room.publicState(playerId));
+  const operations = createRoomDelta(previous.state, state);
+  if (!operations.length) return;
+  const version = previous.version + 1;
+  deliveredRoomStates.set(ws, { code: room.code, version, state });
+  send(ws, "room_delta", { code: room.code, baseVersion: previous.version, version, operations });
+};
+const broadcast = room => {
+  for (const playerId of [...room.players.keys(), ...room.spectators.keys()]) {
+    const ws = sockets.get(playerId);
+    if (ws) sendRoomUpdate(room, playerId, ws);
+  }
+};
 const currentRoomFor = profileId => [...rooms.values()].find(room => room.players.has(profileId) || room.spectators.has(profileId));
 const roomPersistence = new WeakMap();
 const persistRoomEconomy = room => {
@@ -131,7 +179,7 @@ const finishAuthentication = async (ws, profile, sessionToken = null) => {
   if (sessionToken) payload.sessionToken = sessionToken;
   send(ws, "authenticated", payload);
   sendRoomList(ws);
-  sendLeaderboard(ws);
+  await sendLeaderboardSummary(ws, profile.id);
   return dailyGift;
 };
 
@@ -168,16 +216,48 @@ wss.on("connection", (ws, request) => {
   let googleNonce = null;
   let googleNonceExpiresAt = 0;
   let pendingGoogleConfirmation = null;
+  let pendingIntegrityChallenge = null;
+  let integrityVerifiedUntil = 0;
+  let nextIntegrityRequestAt = 0;
+  const requestIntegrityVerdict = () => {
+    if (!isPlayIntegrityConfigured()) {
+      integrityVerifiedUntil = Number.POSITIVE_INFINITY;
+      send(ws, "integrity_status", { status: "not_configured", mode: PLAY_INTEGRITY_MODE });
+      return;
+    }
+    pendingIntegrityChallenge = createIntegrityChallenge();
+    nextIntegrityRequestAt = Date.now() + 60_000;
+    send(ws, "integrity_challenge", {
+      challenge: pendingIntegrityChallenge.challenge,
+      requestHash: pendingIntegrityChallenge.requestHash,
+      cloudProjectNumber: PLAY_INTEGRITY_PROJECT_NUMBER,
+      mode: PLAY_INTEGRITY_MODE,
+    });
+  };
+  const completeAuthentication = async (authenticatedProfile, sessionToken) => {
+    const dailyGift = await finishAuthentication(ws, authenticatedProfile, sessionToken);
+    integrityVerifiedUntil = 0;
+    nextIntegrityRequestAt = 0;
+    pendingIntegrityChallenge = null;
+    if (PLAY_INTEGRITY_MODE !== "off") requestIntegrityVerdict();
+    return dailyGift;
+  };
   console.log(`[socket] Client connected (${addressFingerprint.slice(0, 12)})`);
-  ws.on("message", async raw => { try {
+  ws.on("message", async raw => {
+    let inboundMeasured = false;
+    try {
     const ipTrafficKey = `ip:${addressFingerprint}`;
     if (!trafficLimiter.allow(ipTrafficKey, messageLimitPerTenSeconds, 10_000)) {
+      trafficMetrics.recordInbound("rate_limited", raw);
+      inboundMeasured = true;
       console.warn(`[security] Traffic limit reached for ${addressFingerprint.slice(0, 12)}`);
       fail(ws, "Trop de requêtes. Reconnexion nécessaire.");
       ws.close(1008, "Rate limit");
       return;
     }
     if (profile && !trafficLimiter.allow(`account:${profile.id}`, messageLimitPerTenSeconds, 10_000)) {
+      trafficMetrics.recordInbound("rate_limited", raw);
+      inboundMeasured = true;
       console.warn(`[security] Traffic limit reached for account ${profile.id}`);
       fail(ws, "Trop de requêtes. Reconnexion nécessaire.");
       ws.close(1008, "Rate limit");
@@ -185,7 +265,9 @@ wss.on("connection", (ws, request) => {
     }
     const message = JSON.parse(raw.toString()); const { type } = message;
     messageType = String(type ?? "unknown");
-    console.log(`[message] ${profile?.username ?? "anonymous"} → ${messageType}`);
+    trafficMetrics.recordInbound(messageType, raw);
+    inboundMeasured = true;
+    if (logWebSocketMessages) console.log(`[message] ${profile?.username ?? "anonymous"} → ${messageType}`);
     if (profile && STATE_CHANGING_ACTIONS.has(type) && !trafficLimiter.allow(`action:${profile.id}`, stateActionLimitPerTenSeconds, 10_000)) {
       console.warn(`[security] Action limit reached for account ${profile.id}`);
       fail(ws, "Trop d'actions envoyées. Reconnexion nécessaire.");
@@ -194,6 +276,9 @@ wss.on("connection", (ws, request) => {
     }
     // The Android Google account picker temporarily backgrounds the app. Its
     // resume health check can arrive while the ID token is still being verified.
+    if (type === "client_hello") {
+      return;
+    }
     if (type === "ping") { send(ws, "pong", {}); return; }
     if (type === "request_google_auth") {
       if (!isGoogleAuthConfigured()) throw Error("Connexion Google non configurée sur le serveur");
@@ -251,7 +336,7 @@ wss.on("connection", (ws, request) => {
       authByPlayer.set(googleProfile.id, authRecord);
       playerByGoogleSubject.set(identity.sub, googleProfile.id);
       profile = googleProfile;
-      const dailyGift = await finishAuthentication(ws, profile, issuedToken);
+      const dailyGift = await completeAuthentication(profile, issuedToken);
       console.log(`[player] ${profile.username} authenticated with Google`);
       if (dailyGift.amount > 0) console.log(`[reward] ${profile.username} received ${dailyGift.amount} daily chips`);
       return;
@@ -274,7 +359,7 @@ wss.on("connection", (ws, request) => {
       await store.saveAuthAccount(authRecord);
       authByPlayer.set(googleProfile.id, authRecord);
       profile = googleProfile;
-      const dailyGift = await finishAuthentication(ws, profile, issuedToken);
+      const dailyGift = await completeAuthentication(profile, issuedToken);
       console.log(`[player] ${profile.username} confirmed loading their existing Google account`);
       if (dailyGift.amount > 0) console.log(`[reward] ${profile.username} received ${dailyGift.amount} daily chips`);
       return;
@@ -295,7 +380,7 @@ wss.on("connection", (ws, request) => {
       await store.save(profile, accounts);
       await store.saveAuthAccount(authRecord);
       authByPlayer.set(profile.id, authRecord);
-      const dailyGift = await finishAuthentication(ws, profile, issuedToken);
+      const dailyGift = await completeAuthentication(profile, issuedToken);
       console.log(`[player] ${profile.username} created an account and connected`);
       return;
     }
@@ -316,7 +401,7 @@ wss.on("connection", (ws, request) => {
         await store.saveAuthAccount(authRecord);
         authByPlayer.set(loginProfile.id, authRecord);
         profile = loginProfile;
-        await finishAuthentication(ws, profile, issuedToken);
+        await completeAuthentication(profile, issuedToken);
         console.log(`[player] ${profile.username} connected with a rotated session`);
         return;
       } else {
@@ -326,16 +411,52 @@ wss.on("connection", (ws, request) => {
         await store.saveAuthAccount(authRecord);
         authByPlayer.set(loginProfile.id, authRecord);
         profile = loginProfile;
-        const dailyGift = await finishAuthentication(ws, profile, issuedToken);
+        const dailyGift = await completeAuthentication(profile, issuedToken);
         console.log(`[player] ${profile.username} upgraded to a secured local session`);
         return;
       }
     }
     if (!profile) throw Error("Authentication required");
     if (type === "list_rooms") { sendRoomList(ws); return; }
-    if (type === "get_leaderboard") { sendLeaderboard(ws); return; }
+    if (type === "get_leaderboard") { await sendLeaderboardSummary(ws, profile.id); return; }
+    if (type === "get_leaderboard_page") { await sendLeaderboardPage(ws, profile.id, message.page); return; }
+    if (type === "request_room_snapshot") {
+      const activeRoom = currentRoomFor(profile.id);
+      if (!activeRoom) throw Error("Join a room first");
+      sendRoomSnapshot(activeRoom, profile.id, ws);
+      return;
+    }
     if (type === "get_daily_roulette") { send(ws, "daily_roulette_status", { roulette: dailyRouletteStatus(profile) }); return; }
     if (type === "get_safety_grant") { send(ws, "safety_grant_status", { safetyGrant: store.safetyGrantStatus(profile), profile }); return; }
+    if (type === "submit_integrity") {
+      const challenge = String(message.challenge ?? "");
+      const pending = pendingIntegrityChallenge;
+      if (!pending || challenge !== pending.challenge || Date.now() > pending.expiresAt) {
+        pendingIntegrityChallenge = null;
+        send(ws, "integrity_status", { status: "expired", mode: PLAY_INTEGRITY_MODE });
+        return;
+      }
+      pendingIntegrityChallenge = null;
+      try {
+        const verdict = await decodeAndAssessIntegrityToken(message.integrityToken, pending.requestHash);
+        if (verdict.accepted) {
+          integrityVerifiedUntil = Date.now() + PLAY_INTEGRITY_VERIFIED_TTL_MS;
+          send(ws, "integrity_status", { status: "verified", mode: PLAY_INTEGRITY_MODE });
+          console.log(`[integrity] ${profile.username} verified`);
+        } else {
+          send(ws, "integrity_status", { status: "rejected", mode: PLAY_INTEGRITY_MODE });
+          console.warn(`[integrity] ${profile.username} rejected: ${verdict.reasons.join(",")}`);
+        }
+      } catch (error) {
+        send(ws, "integrity_status", { status: "error", mode: PLAY_INTEGRITY_MODE });
+        console.warn(`[integrity] ${profile.username} verification error: ${error.message}`);
+      }
+      return;
+    }
+    if (type === "integrity_client_error") {
+      console.warn(`[integrity] ${profile.username} client error: ${String(message.message ?? "unknown").slice(0, 180)}`);
+      return;
+    }
     if (type === "logout") {
       const departingProfile = profile;
       const activeRoom = currentRoomFor(departingProfile.id);
@@ -348,6 +469,7 @@ wss.on("connection", (ws, request) => {
         authRecord.previousSessionExpiresAt = null;
       }
       sockets.delete(departingProfile.id);
+      deliveredRoomStates.delete(ws);
       profile = null;
       send(ws, "logged_out", {});
       console.log(`[player] ${departingProfile.username} logged out`);
@@ -362,12 +484,16 @@ wss.on("connection", (ws, request) => {
       authByPlayer.delete(deletedProfile.id);
       if (authRecord?.googleSub && playerByGoogleSubject.get(authRecord.googleSub) === deletedProfile.id) playerByGoogleSubject.delete(authRecord.googleSub);
       sockets.delete(deletedProfile.id);
+      deliveredRoomStates.delete(ws);
       profile = null;
       send(ws, "account_deleted", {});
       broadcastRoomList();
-      for (const clientSocket of sockets.values()) sendLeaderboard(clientSocket);
       console.log(`[player] ${deletedProfile.username} deleted their account`);
       return;
+    }
+    if (STATE_CHANGING_ACTIONS.has(type) && !INTEGRITY_BYPASS_ACTIONS.has(type) && integrityVerifiedUntil <= Date.now()) {
+      if (!pendingIntegrityChallenge && Date.now() >= nextIntegrityRequestAt) requestIntegrityVerdict();
+      if (PLAY_INTEGRITY_MODE === "enforce") throw Error("Vérification de l'intégrité de l'application requise");
     }
     if (type === "claim_safety_grant") {
       const grantRoom = currentRoomFor(profile.id);
@@ -378,7 +504,7 @@ wss.on("connection", (ws, request) => {
       const safetyGrant = await store.claimSafetyGrant(profile, accounts, { rewarded: true });
       send(ws, "safety_grant_status", { safetyGrant, profile });
       if (grantRoom) broadcast(grantRoom);
-      sendLeaderboard(ws);
+      await sendLeaderboardSummary(ws, profile.id);
       return;
     }
     if (type === "claim_daily_roulette") {
@@ -395,7 +521,7 @@ wss.on("connection", (ws, request) => {
         eventId: `daily-roulette:${profile.id}:${profile.lastRoulette}`,
       });
       send(ws, "daily_roulette_result", rouletteResult);
-      sendLeaderboard(ws);
+      await sendLeaderboardSummary(ws, profile.id);
       return;
     }
     if (type === "create_room") {
@@ -429,6 +555,7 @@ wss.on("connection", (ws, request) => {
     const phaseBeforeAction = room.phase;
     if (type === "leave_room") {
       await removeFromRoom(room, profile);
+      deliveredRoomStates.delete(ws);
       send(ws, "left_room", { profile });
       return;
     }
@@ -449,6 +576,7 @@ wss.on("connection", (ws, request) => {
     await saveRoomProfiles(room); broadcast(room);
     if (room.phase !== phaseBeforeAction) broadcastRoomList();
   } catch (error) {
+    if (!inboundMeasured) trafficMetrics.recordInbound("invalid", raw);
     console.warn(`[error] ${profile?.username ?? "anonymous"} → ${messageType}: ${error.message}`);
     fail(ws, error.message);
   } });
@@ -463,14 +591,19 @@ wss.on("connection", (ws, request) => {
     if (!profile || sockets.get(profile.id) !== ws) return;
     console.log(`[player] ${profile.username} disconnected`);
     sockets.delete(profile.id);
+    deliveredRoomStates.delete(ws);
     for (const room of rooms.values()) if (room.players.has(profile.id) || room.spectators.has(profile.id)) void removeFromRoom(room, profile);
   });
 });
 
 await store.initialize();
+if (PLAY_INTEGRITY_MODE === "enforce" && !isPlayIntegrityConfigured()) throw Error("Play Integrity enforce mode requires GOOGLE_CLOUD_PROJECT_NUMBER and Google service account credentials");
 for (const profile of await store.loadAll()) accounts.set(profile.id, profile);
 for (const authRecord of await store.loadAuthAccounts()) {
   authByPlayer.set(authRecord.playerId, authRecord);
   if (authRecord.googleSub) playerByGoogleSubject.set(authRecord.googleSub, authRecord.playerId);
 }
-server.listen(process.env.PORT || 3000, () => console.log(`Blackjack server listening with ${process.env.DATABASE_URL ? "PostgreSQL" : "file"} persistence; Google auth ${isGoogleAuthConfigured() ? "enabled" : "disabled"}`));
+server.listen(process.env.PORT || 3000, () => {
+  console.log(`Blackjack server listening with ${process.env.DATABASE_URL ? "PostgreSQL" : "file"} persistence; Google auth ${isGoogleAuthConfigured() ? "enabled" : "disabled"}; Play Integrity ${PLAY_INTEGRITY_MODE}${isPlayIntegrityConfigured() ? "" : " (not configured)"}`);
+  if (PLAY_INTEGRITY_MODE === "audit" && !isPlayIntegrityConfigured()) console.warn("[integrity] Audit is enabled but server credentials or GOOGLE_CLOUD_PROJECT_NUMBER are missing");
+});
