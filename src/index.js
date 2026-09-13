@@ -8,7 +8,8 @@ import { PlayerStore } from "./player-store.js";
 import { TrafficMetrics } from "./traffic-metrics.js";
 import { RealtimeTransport } from "./realtime-transport.js";
 import { applyRoomAction } from "./room-actions.js";
-import { FixedWindowRateLimiter, fingerprintAddress, getClientAddress, readIntegerSetting } from "./security.js";
+import { fingerprintAddress, getClientAddress, readIntegerSetting } from "./security.js";
+import { RealtimeRateGuard } from "./realtime-rate-guard.js";
 import { normalizeCrashReport } from "./crash-reports.js";
 import { isGoogleAuthConfigured, verifyGoogleIdToken } from "./google-auth.js";
 import { newSessionToken, rotatedAuthRecord, sessionCredentialHash, sessionTokenHash, tokenMatches } from "./auth-session.js";
@@ -29,13 +30,23 @@ const addressHashSecret = abuseHashSecret || crypto.randomBytes(32).toString("he
 const registrationIpLimit = readIntegerSetting("REGISTRATION_IP_LIMIT", 3, 1, 100);
 const dailyRouletteIpLimit = readIntegerSetting("DAILY_ROULETTE_IP_LIMIT", 3, 1, 100);
 const maxConnectionsPerIp = readIntegerSetting("MAX_CONNECTIONS_PER_IP", 5, 1, 100);
-const messageLimitPerTenSeconds = readIntegerSetting("MESSAGE_LIMIT_PER_10S", 40, 10, 500);
-const stateActionLimitPerTenSeconds = readIntegerSetting("STATE_ACTION_LIMIT_PER_10S", 15, 5, 100);
+const legacyMessageLimit = readIntegerSetting("MESSAGE_LIMIT_PER_10S", 150, 10, 1_000);
+const connectionMessageLimitPerTenSeconds = readIntegerSetting("CONNECTION_MESSAGE_LIMIT_PER_10S", legacyMessageLimit, 20, 1_000);
+const accountMessageLimitPerTenSeconds = readIntegerSetting("ACCOUNT_MESSAGE_LIMIT_PER_10S", 180, 20, 1_000);
+const ipMessageLimitPerTenSeconds = readIntegerSetting("IP_MESSAGE_LIMIT_PER_10S", 300, 40, 2_000);
+const stateActionLimitPerTenSeconds = readIntegerSetting("STATE_ACTION_LIMIT_PER_10S", 30, 5, 200);
+const betActionLimitPerTenSeconds = readIntegerSetting("BET_ACTION_LIMIT_PER_10S", 80, 10, 500);
 const crashReportsPerAccountPerDay = readIntegerSetting("CRASH_REPORTS_PER_ACCOUNT_PER_DAY", 3, 1, 10);
 const crashReportsPerIpPerDay = readIntegerSetting("CRASH_REPORTS_PER_IP_PER_DAY", 20, 1, 100);
 const crashReportsEnabled = String(process.env.CRASH_REPORTS_ENABLED ?? "true").toLowerCase() === "true";
 const connectionCounts = new Map();
-const trafficLimiter = new FixedWindowRateLimiter();
+const realtimeRateGuard = new RealtimeRateGuard({
+  connectionLimit: connectionMessageLimitPerTenSeconds,
+  accountLimit: accountMessageLimitPerTenSeconds,
+  ipLimit: ipMessageLimitPerTenSeconds,
+  stateActionLimit: stateActionLimitPerTenSeconds,
+  betActionLimit: betActionLimitPerTenSeconds,
+});
 const trafficMetrics = new TrafficMetrics({ intervalSeconds: readIntegerSetting("TRAFFIC_METRICS_INTERVAL_SECONDS", 300, 0, 86_400) });
 const realtime = new RealtimeTransport({ metrics: trafficMetrics });
 const logWebSocketMessages = String(process.env.LOG_WS_MESSAGES ?? (process.env.NODE_ENV === "production" ? "false" : "true")).toLowerCase() === "true";
@@ -176,6 +187,7 @@ const roomUpdateHandler = () => {
 const server = http.createServer((req, res) => { res.writeHead(req.url === "/health" ? 200 : 404, { "content-type": "application/json" }); res.end(JSON.stringify({ status: "ok", persistence: process.env.DATABASE_URL ? "postgres" : "file" })); });
 const wss = new WebSocketServer({ server, maxPayload: 16 * 1024, perMessageDeflate: false });
 wss.on("connection", (ws, request) => {
+  const connectionId = id();
   const clientAddress = getClientAddress(request);
   const addressFingerprint = fingerprintAddress(clientAddress, addressHashSecret);
   const openConnections = connectionCounts.get(addressFingerprint) ?? 0;
@@ -195,6 +207,7 @@ wss.on("connection", (ws, request) => {
   let pendingIntegrityChallenge = null;
   let integrityVerifiedUntil = 0;
   let nextIntegrityRequestAt = 0;
+  let lastSoftRateLimitNoticeAt = 0;
   const requestIntegrityVerdict = () => {
     if (!isPlayIntegrityConfigured()) {
       integrityVerifiedUntil = Number.POSITIVE_INFINITY;
@@ -222,20 +235,16 @@ wss.on("connection", (ws, request) => {
   ws.on("message", async raw => {
     let inboundMeasured = false;
     try {
-    const ipTrafficKey = `ip:${addressFingerprint}`;
-    if (!trafficLimiter.allow(ipTrafficKey, messageLimitPerTenSeconds, 10_000)) {
+    const trafficVerdict = realtimeRateGuard.checkTraffic({
+      connectionId,
+      addressFingerprint,
+      accountId: profile?.id ?? null,
+    });
+    if (!trafficVerdict.allowed) {
       trafficMetrics.recordInbound("rate_limited", raw);
       inboundMeasured = true;
-      console.warn(`[security] Traffic limit reached for ${addressFingerprint.slice(0, 12)}`);
-      fail(ws, "Trop de requêtes. Reconnexion nécessaire.");
-      ws.close(1008, "Rate limit");
-      return;
-    }
-    if (profile && !trafficLimiter.allow(`account:${profile.id}`, messageLimitPerTenSeconds, 10_000)) {
-      trafficMetrics.recordInbound("rate_limited", raw);
-      inboundMeasured = true;
-      console.warn(`[security] Traffic limit reached for account ${profile.id}`);
-      fail(ws, "Trop de requêtes. Reconnexion nécessaire.");
+      console.warn(`[security] Hard traffic limit reached (${trafficVerdict.scope}) for ${addressFingerprint.slice(0, 12)}`);
+      fail(ws, "Activité réseau anormalement élevée. Reconnexion nécessaire.");
       ws.close(1008, "Rate limit");
       return;
     }
@@ -244,10 +253,21 @@ wss.on("connection", (ws, request) => {
     trafficMetrics.recordInbound(messageType, raw);
     inboundMeasured = true;
     if (logWebSocketMessages) console.log(`[message] ${profile?.username ?? "anonymous"} → ${messageType}`);
-    if (profile && STATE_CHANGING_ACTIONS.has(type) && !trafficLimiter.allow(`action:${profile.id}`, stateActionLimitPerTenSeconds, 10_000)) {
-      console.warn(`[security] Action limit reached for account ${profile.id}`);
-      fail(ws, "Trop d'actions envoyées. Reconnexion nécessaire.");
-      ws.close(1008, "Action rate limit");
+    const actionVerdict = realtimeRateGuard.checkAction({
+      accountId: profile?.id ?? null,
+      type,
+      isStateChanging: STATE_CHANGING_ACTIONS.has(type),
+    });
+    if (!actionVerdict.allowed) {
+      const now = Date.now();
+      if (now - lastSoftRateLimitNoticeAt >= 2_000) {
+        lastSoftRateLimitNoticeAt = now;
+        const notice = actionVerdict.category === "bet"
+          ? "Mises trop rapides : certaines pressions ont été ignorées."
+          : "Action trop rapide, veuillez réessayer.";
+        console.warn(`[security] Soft ${actionVerdict.category} limit reached for account ${profile.id}`);
+        fail(ws, notice);
+      }
       return;
     }
     // The Android Google account picker temporarily backgrounds the app. Its

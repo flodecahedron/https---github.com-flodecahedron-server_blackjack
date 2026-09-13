@@ -43,10 +43,16 @@ services:
         value: "3"
       - key: MAX_CONNECTIONS_PER_IP
         value: "5"
-      - key: MESSAGE_LIMIT_PER_10S
-        value: "40"
+      - key: CONNECTION_MESSAGE_LIMIT_PER_10S
+        value: "150"
+      - key: ACCOUNT_MESSAGE_LIMIT_PER_10S
+        value: "180"
+      - key: IP_MESSAGE_LIMIT_PER_10S
+        value: "300"
       - key: STATE_ACTION_LIMIT_PER_10S
-        value: "100"
+        value: "30"
+      - key: BET_ACTION_LIMIT_PER_10S
+        value: "80"
       - key: LOG_WS_MESSAGES
         value: "false"
       - key: TRAFFIC_METRICS_INTERVAL_SECONDS

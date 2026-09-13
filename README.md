@@ -42,8 +42,9 @@ Un joueur à zéro reçoit automatiquement un premier secours de 100 jetons par 
 Les contrôles importants sont côté serveur :
 
 - taille maximale de message WebSocket : 16 Kio ;
-- `MESSAGE_LIMIT_PER_10S=40` messages par adresse réseau et par compte ;
-- `STATE_ACTION_LIMIT_PER_10S=15` actions de jeu par compte ;
+- `CONNECTION_MESSAGE_LIMIT_PER_10S=150`, `ACCOUNT_MESSAGE_LIMIT_PER_10S=180` et `IP_MESSAGE_LIMIT_PER_10S=300` sont des plafonds d'urgence contre un véritable déluge réseau ; eux seuls ferment la connexion ;
+- `BET_ACTION_LIMIT_PER_10S=80` tolère les rafales de clics sur les jetons (y compris à deux doigts). Au-delà, seules les mises excédentaires sont ignorées, sans expulsion de la room ;
+- `STATE_ACTION_LIMIT_PER_10S=30` ralentit de la même façon les autres actions de jeu, sans fermer la connexion ;
 - `MAX_CONNECTIONS_PER_IP=5` connexions simultanées par adresse réseau ;
 - `REGISTRATION_IP_LIMIT=3` nouveaux comptes par réseau sur 24 heures ;
 - `DAILY_ROULETTE_IP_LIMIT=3` roulettes quotidiennes par réseau sur 24 heures ;
