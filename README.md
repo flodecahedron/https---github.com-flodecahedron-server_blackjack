@@ -2,6 +2,16 @@
 
 Serveur WebSocket autoritaire pour le blackjack et la roulette américaine multijoueur. Les cartes, tirages, mises, actions, soldes et gains ne sont jamais calculés par le client.
 
+## Structure interne
+
+- `index.js` assemble les services, authentifie les connexions et orchestre leur cycle de vie ;
+- `realtime-transport.js` sérialise les messages et gère snapshots, versions et deltas par client ;
+- `room-actions.js` route les commandes vers la bonne mécanique sans mélanger blackjack et roulette ;
+- `game-room.js` et `roulette-room.js` restent les modèles autoritaires des parties ;
+- `player-store.js` concentre la persistance Neon et son mode fichier de développement.
+
+Cette séparation doit être conservée : les scènes Godot animent et présentent les états reçus, mais aucune décision économique ou aléatoire ne doit leur être transférée.
+
 ## Déploiement Render avec Neon
 
 Le fichier `render.yaml` à la racine du dépôt serveur décrit uniquement le Web Service. PostgreSQL est hébergé séparément chez Neon. Dans Render :

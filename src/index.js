@@ -5,8 +5,9 @@ import { DAILY_ROULETTE_SEGMENTS, claimDailyRoulette, dailyReward, dailyRoulette
 import { GameRoom } from "./game-room.js";
 import { RouletteRoom } from "./roulette-room.js";
 import { PlayerStore } from "./player-store.js";
-import { createRoomDelta } from "./room-delta.js";
 import { TrafficMetrics } from "./traffic-metrics.js";
+import { RealtimeTransport } from "./realtime-transport.js";
+import { applyRoomAction } from "./room-actions.js";
 import { FixedWindowRateLimiter, fingerprintAddress, getClientAddress, readIntegerSetting } from "./security.js";
 import { isGoogleAuthConfigured, verifyGoogleIdToken } from "./google-auth.js";
 import { newSessionToken, rotatedAuthRecord, sessionCredentialHash, sessionTokenHash, tokenMatches } from "./auth-session.js";
@@ -32,8 +33,8 @@ const stateActionLimitPerTenSeconds = readIntegerSetting("STATE_ACTION_LIMIT_PER
 const connectionCounts = new Map();
 const trafficLimiter = new FixedWindowRateLimiter();
 const trafficMetrics = new TrafficMetrics({ intervalSeconds: readIntegerSetting("TRAFFIC_METRICS_INTERVAL_SECONDS", 300, 0, 86_400) });
+const realtime = new RealtimeTransport({ metrics: trafficMetrics });
 const logWebSocketMessages = String(process.env.LOG_WS_MESSAGES ?? (process.env.NODE_ENV === "production" ? "false" : "true")).toLowerCase() === "true";
-const deliveredRoomStates = new WeakMap();
 const persistentQuotaWindow = 24 * 60 * 60 * 1000;
 const allowGuestAuth = String(process.env.ALLOW_GUEST_AUTH ?? "true").toLowerCase() === "true";
 const STATE_CHANGING_ACTIONS = new Set([
@@ -46,14 +47,8 @@ const STATE_CHANGING_ACTIONS = new Set([
 const INTEGRITY_BYPASS_ACTIONS = new Set(["leave_room", "become_spectator", "leave_dealer", "leave_dealer_queue", "logout", "delete_account"]);
 const ROOM_CODES = ["ABLE", "BAKE", "BIRD", "BLUE", "BOLD", "CALM", "DARK", "DOVE", "EAST", "FIRE", "GOLD", "HILL", "JUMP", "LIME", "MOON", "ROSE", "SAND", "STAR", "WAVE", "WIND"];
 const id = () => crypto.randomUUID();
-const send = (ws, type, payload) => {
-  if (ws.readyState !== ws.OPEN) return false;
-  const serialized = JSON.stringify({ type, ...payload });
-  trafficMetrics.recordOutbound(type, serialized);
-  ws.send(serialized);
-  return true;
-};
-const fail = (ws, message) => send(ws, "error", { message });
+const send = (ws, type, payload = {}) => realtime.send(ws, type, payload);
+const fail = (ws, message) => realtime.fail(ws, message);
 const roomSummary = room => ({
   game: room.game ?? "blackjack",
   code: room.code,
@@ -79,31 +74,8 @@ const roomCode = () => {
   if (!available.length) throw Error("Toutes les tables sont occupées");
   return available[crypto.randomInt(available.length)];
 };
-const sendRoomSnapshot = (room, playerId, ws) => {
-  const state = structuredClone(room.publicState(playerId));
-  const version = (deliveredRoomStates.get(ws)?.version ?? 0) + 1;
-  deliveredRoomStates.set(ws, { code: room.code, version, state });
-  send(ws, "room_snapshot", { room: state, version });
-};
-const sendRoomUpdate = (room, playerId, ws) => {
-  const previous = deliveredRoomStates.get(ws);
-  if (!previous || previous.code !== room.code) {
-    sendRoomSnapshot(room, playerId, ws);
-    return;
-  }
-  const state = structuredClone(room.publicState(playerId));
-  const operations = createRoomDelta(previous.state, state);
-  if (!operations.length) return;
-  const version = previous.version + 1;
-  deliveredRoomStates.set(ws, { code: room.code, version, state });
-  send(ws, "room_delta", { code: room.code, baseVersion: previous.version, version, operations });
-};
-const broadcast = room => {
-  for (const playerId of [...room.players.keys(), ...room.spectators.keys()]) {
-    const ws = sockets.get(playerId);
-    if (ws) sendRoomUpdate(room, playerId, ws);
-  }
-};
+const sendRoomSnapshot = (room, playerId, ws) => realtime.sendRoomSnapshot(room, playerId, ws);
+const broadcast = room => realtime.broadcastRoom(room, sockets);
 const currentRoomFor = profileId => [...rooms.values()].find(room => room.players.has(profileId) || room.spectators.has(profileId));
 const roomPersistence = new WeakMap();
 const persistRoomEconomy = room => {
@@ -469,7 +441,7 @@ wss.on("connection", (ws, request) => {
         authRecord.previousSessionExpiresAt = null;
       }
       sockets.delete(departingProfile.id);
-      deliveredRoomStates.delete(ws);
+      realtime.forget(ws);
       profile = null;
       send(ws, "logged_out", {});
       console.log(`[player] ${departingProfile.username} logged out`);
@@ -484,7 +456,7 @@ wss.on("connection", (ws, request) => {
       authByPlayer.delete(deletedProfile.id);
       if (authRecord?.googleSub && playerByGoogleSubject.get(authRecord.googleSub) === deletedProfile.id) playerByGoogleSubject.delete(authRecord.googleSub);
       sockets.delete(deletedProfile.id);
-      deliveredRoomStates.delete(ws);
+      realtime.forget(ws);
       profile = null;
       send(ws, "account_deleted", {});
       broadcastRoomList();
@@ -555,24 +527,14 @@ wss.on("connection", (ws, request) => {
     const phaseBeforeAction = room.phase;
     if (type === "leave_room") {
       await removeFromRoom(room, profile);
-      deliveredRoomStates.delete(ws);
+      realtime.forget(ws);
       send(ws, "left_room", { profile });
       return;
     }
     if (type === "take_seat") { room.addPlayer(profile); broadcast(room); return; }
     if (type === "become_spectator") { room.becomeSpectator(profile.id); await saveRoomProfiles(room); broadcast(room); return; }
     if (!room.players.has(profile.id)) throw Error("You are spectating this round");
-    if (room.game === "roulette") {
-      if (type === "roulette_bet") room.placeBet(profile.id, message.bet, Number(message.amount));
-      else if (type === "roulette_clear_bets") room.clearBets(profile.id);
-      else if (type === "ready") room.readyPlayer(profile.id);
-      else if (type === "unready") room.unreadyPlayer(profile.id);
-      else throw Error("Unknown roulette action");
-    }
-    else if (type === "bet") room.placeBet(profile.id, Number(message.amount));
-    else if (type === "ready") room.readyPlayer(profile.id);
-    else if (type === "unready") room.unreadyPlayer(profile.id);
-    else if (type === "start") room.startIfReady(); else if (type === "hit") room.hit(profile.id); else if (type === "stand") room.stand(profile.id); else if (type === "dealer_hit") room.dealerHit(profile.id); else if (type === "dealer_stand") room.dealerStand(profile.id); else if (type === "double") room.double(profile.id); else if (type === "split") room.split(profile.id); else if (type === "surrender") room.surrender(profile.id); else if (type === "next_round") room.nextRound(); else if (type === "become_dealer") room.setDealer(profile.id); else if (type === "leave_dealer") room.removeDealer(profile.id); else if (type === "leave_dealer_queue") room.cancelDealerRequest(profile.id); else throw Error("Unknown action");
+    applyRoomAction(room, profile.id, type, message);
     await saveRoomProfiles(room); broadcast(room);
     if (room.phase !== phaseBeforeAction) broadcastRoomList();
   } catch (error) {
@@ -591,7 +553,7 @@ wss.on("connection", (ws, request) => {
     if (!profile || sockets.get(profile.id) !== ws) return;
     console.log(`[player] ${profile.username} disconnected`);
     sockets.delete(profile.id);
-    deliveredRoomStates.delete(ws);
+    realtime.forget(ws);
     for (const room of rooms.values()) if (room.players.has(profile.id) || room.spectators.has(profile.id)) void removeFromRoom(room, profile);
   });
 });
