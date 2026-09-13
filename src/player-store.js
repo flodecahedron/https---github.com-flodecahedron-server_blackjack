@@ -17,11 +17,13 @@ export class PlayerStore {
     this.pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_URL.includes("render.com") ? { rejectUnauthorized: false } : undefined }) : null;
     this.localAbuseEvents = [];
     this.localAuthAccounts = new Map();
+    this.localCrashReports = [];
   }
   async initialize() {
     if (this.pool) {
       await runMigrations(this.pool);
       await this.pool.query("DELETE FROM blackjack_abuse_events WHERE created_at < NOW() - INTERVAL '8 days'");
+      await this.pool.query("DELETE FROM bedealer_crash_reports WHERE received_at < NOW() - INTERVAL '30 days'");
       return;
     }
     await mkdir(dirname(this.filePath), { recursive: true });
@@ -114,6 +116,52 @@ export class PlayerStore {
       .sort((left, right) => right.balance - left.balance || left.username.localeCompare(right.username) || left.id.localeCompare(right.id))
       .map((player, index) => ({ id: player.id, rank: index + 1, username: player.username, balance: player.balance }));
   }
+
+  async saveCrashReport(playerId, report, dailyLimit = 3) {
+    const normalizedLimit = Math.max(1, Math.min(10, Number.parseInt(dailyLimit, 10) || 3));
+    if (!this.pool) {
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      this.localCrashReports = this.localCrashReports.filter(entry => entry.receivedAt >= cutoff);
+      if (this.localCrashReports.some(entry => entry.reportId === report.reportId)) return { accepted: false, reason: "duplicate" };
+      if (this.localCrashReports.filter(entry => entry.playerId === playerId).length >= normalizedLimit) return { accepted: false, reason: "quota" };
+      this.localCrashReports.push({ ...report, playerId, receivedAt: Date.now() });
+      return { accepted: true, reason: "stored" };
+    }
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`crash-report:${playerId}`]);
+      const existing = await client.query("SELECT 1 FROM bedealer_crash_reports WHERE report_id=$1", [report.reportId]);
+      if (existing.rowCount) {
+        await client.query("ROLLBACK");
+        return { accepted: false, reason: "duplicate" };
+      }
+      const count = await client.query(
+        "SELECT COUNT(*)::INTEGER AS total FROM bedealer_crash_reports WHERE player_id=$1 AND received_at >= NOW() - INTERVAL '24 hours'",
+        [playerId],
+      );
+      if ((count.rows[0]?.total ?? 0) >= normalizedLimit) {
+        await client.query("ROLLBACK");
+        return { accepted: false, reason: "quota" };
+      }
+      await client.query("DELETE FROM bedealer_crash_reports WHERE received_at < NOW() - INTERVAL '30 days'");
+      await client.query(
+        `INSERT INTO bedealer_crash_reports
+          (report_id, player_id, kind, app_version, version_code, platform, os_version, device_model, scene, diagnostics, occurred_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::JSONB,$11)`,
+        [report.reportId, playerId, report.kind, report.appVersion, report.versionCode, report.platform, report.osVersion, report.deviceModel, report.scene, JSON.stringify(report.diagnostics), report.occurredAt],
+      );
+      await client.query("COMMIT");
+      return { accepted: true, reason: "stored" };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async save(profile, accounts) {
     if (this.pool) {
       await this.pool.query("INSERT INTO blackjack_players (id, username, avatar, balance, login_streak, last_login, last_roulette, last_safety_grant, rewarded_grant_date, rewarded_grant_count, last_rewarded_grant_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO UPDATE SET avatar=EXCLUDED.avatar, balance=EXCLUDED.balance, login_streak=EXCLUDED.login_streak, last_login=EXCLUDED.last_login, last_roulette=EXCLUDED.last_roulette, last_safety_grant=EXCLUDED.last_safety_grant, rewarded_grant_date=EXCLUDED.rewarded_grant_date, rewarded_grant_count=EXCLUDED.rewarded_grant_count, last_rewarded_grant_at=EXCLUDED.last_rewarded_grant_at", [profile.id, profile.username, profile.avatar, profile.balance, profile.loginStreak, profile.lastLogin, profile.lastRoulette ?? null, profile.lastSafetyGrant ?? null, profile.rewardedGrantDate ?? null, profile.rewardedGrantCount ?? 0, profile.lastRewardedGrantAt ?? null]);
@@ -350,6 +398,7 @@ export class PlayerStore {
     }
     accounts.delete(playerId);
     this.localAuthAccounts.delete(playerId);
+    this.localCrashReports = this.localCrashReports.filter(report => report.playerId !== playerId);
     const temporaryPlayers = `${this.filePath}.tmp`;
     await writeFile(temporaryPlayers, JSON.stringify([...accounts.values()], null, 2));
     await rename(temporaryPlayers, this.filePath);

@@ -51,6 +51,12 @@ services:
         value: "false"
       - key: TRAFFIC_METRICS_INTERVAL_SECONDS
         value: "300"
+      - key: CRASH_REPORTS_ENABLED
+        value: "true"
+      - key: CRASH_REPORTS_PER_ACCOUNT_PER_DAY
+        value: "3"
+      - key: CRASH_REPORTS_PER_IP_PER_DAY
+        value: "20"
       - key: SESSION_TTL_DAYS
         value: "90"
       - key: SESSION_ROTATION_GRACE_MINUTES

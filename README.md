@@ -79,6 +79,22 @@ Le serveur vérifie la signature, l'audience, l'expiration et le nonce de l'ID t
 
 Les sessions applicatives sont hachées en base, expirent après 90 jours et sont renouvelées à chaque restauration réussie. L'ancien jeton reste valable cinq minutes uniquement pour absorber une réponse perdue pendant la rotation. Une déconnexion révoque immédiatement la session. La suppression de compte efface le profil, le journal financier et la liaison Google par cascade SQL. L'adresse e-mail Google n'est ni utilisée ni stockée ; la migration vide les anciennes valeurs tout en conservant temporairement la colonne vide pour permettre un rollback Render sûr.
 
+## Rapports de crash
+
+Avec l'option client « Envoyer les rapports de crash » activée, un diagnostic limité est transmis après le redémarrage qui suit un arrêt anormal. Le serveur n'accepte que trois rapports par compte et par période de 24 heures, vingt par réseau, et 12 Kio au maximum par rapport. Les e-mails, jetons Bearer et structures de JWT sont supprimés côté client avant l'envoi, puis filtrés une seconde fois côté serveur. Les rapports expirent automatiquement après 30 jours et sont supprimés avec le compte joueur.
+
+Les diagnostics sont stockés dans `bedealer_crash_reports`. Ils contiennent la version de l'application, Android, le modèle, la scène, une trace technique limitée et les quarante dernières lignes du journal interne. Ils ne contiennent ni solde, ni adresse e-mail, ni jeton Google, ni jeton de session.
+
+Pour consulter les derniers rapports dans Neon :
+
+```sql
+SELECT report_id, kind, app_version, version_code, platform, os_version,
+       device_model, scene, diagnostics, occurred_at, received_at
+FROM bedealer_crash_reports
+ORDER BY received_at DESC
+LIMIT 50;
+```
+
 Le serveur de production utilise Node.js 24, fixé par `package.json`, `.node-version` et `NODE_VERSION` dans le Blueprint Render. Les durées sont configurables avec `SESSION_TTL_DAYS` et `SESSION_ROTATION_GRACE_MINUTES`.
 
 Pour rendre les bots sensiblement plus difficiles que par la seule connexion Google, valider aussi un jeton **Google Play Integrity** côté serveur lors de la création du compte et des actions à forte valeur. Google Sign-In empêche l'usurpation d'un compte quand l'ID token est vérifié, mais ne garantit pas à lui seul qu'un humain n'automatise pas plusieurs comptes Google.

@@ -9,6 +9,7 @@ import { TrafficMetrics } from "./traffic-metrics.js";
 import { RealtimeTransport } from "./realtime-transport.js";
 import { applyRoomAction } from "./room-actions.js";
 import { FixedWindowRateLimiter, fingerprintAddress, getClientAddress, readIntegerSetting } from "./security.js";
+import { normalizeCrashReport } from "./crash-reports.js";
 import { isGoogleAuthConfigured, verifyGoogleIdToken } from "./google-auth.js";
 import { newSessionToken, rotatedAuthRecord, sessionCredentialHash, sessionTokenHash, tokenMatches } from "./auth-session.js";
 import {
@@ -30,6 +31,9 @@ const dailyRouletteIpLimit = readIntegerSetting("DAILY_ROULETTE_IP_LIMIT", 3, 1,
 const maxConnectionsPerIp = readIntegerSetting("MAX_CONNECTIONS_PER_IP", 5, 1, 100);
 const messageLimitPerTenSeconds = readIntegerSetting("MESSAGE_LIMIT_PER_10S", 40, 10, 500);
 const stateActionLimitPerTenSeconds = readIntegerSetting("STATE_ACTION_LIMIT_PER_10S", 15, 5, 100);
+const crashReportsPerAccountPerDay = readIntegerSetting("CRASH_REPORTS_PER_ACCOUNT_PER_DAY", 3, 1, 10);
+const crashReportsPerIpPerDay = readIntegerSetting("CRASH_REPORTS_PER_IP_PER_DAY", 20, 1, 100);
+const crashReportsEnabled = String(process.env.CRASH_REPORTS_ENABLED ?? "true").toLowerCase() === "true";
 const connectionCounts = new Map();
 const trafficLimiter = new FixedWindowRateLimiter();
 const trafficMetrics = new TrafficMetrics({ intervalSeconds: readIntegerSetting("TRAFFIC_METRICS_INTERVAL_SECONDS", 300, 0, 86_400) });
@@ -400,6 +404,26 @@ wss.on("connection", (ws, request) => {
     }
     if (type === "get_daily_roulette") { send(ws, "daily_roulette_status", { roulette: dailyRouletteStatus(profile) }); return; }
     if (type === "get_safety_grant") { send(ws, "safety_grant_status", { safetyGrant: store.safetyGrantStatus(profile), profile }); return; }
+    if (type === "report_crash") {
+      const reportId = String(message.reportId ?? "").slice(0, 80);
+      if (!crashReportsEnabled) {
+        send(ws, "crash_report_received", { reportId, accepted: false });
+        return;
+      }
+      try {
+        const report = normalizeCrashReport(message);
+        const ipAllowed = await store.consumeQuota(addressFingerprint, "crash_report", crashReportsPerIpPerDay, persistentQuotaWindow);
+        const result = ipAllowed
+          ? await store.saveCrashReport(profile.id, report, crashReportsPerAccountPerDay)
+          : { accepted: false, reason: "ip_quota" };
+        send(ws, "crash_report_received", { reportId: report.reportId, accepted: result.accepted });
+        if (result.accepted) console.warn(`[crash] Report ${report.reportId} stored for ${profile.username} (${report.kind}, ${report.appVersion})`);
+      } catch (error) {
+        console.warn(`[crash] Rejected report for ${profile.username}: ${error.message}`);
+        send(ws, "crash_report_received", { reportId, accepted: false });
+      }
+      return;
+    }
     if (type === "submit_integrity") {
       const challenge = String(message.challenge ?? "");
       const pending = pendingIntegrityChallenge;
