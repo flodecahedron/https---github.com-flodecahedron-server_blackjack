@@ -1,4 +1,4 @@
-# Serveur Casino Royale
+# Serveur BeDealer
 
 Serveur WebSocket autoritaire pour le blackjack et la roulette américaine multijoueur. Les cartes, tirages, mises, actions, soldes et gains ne sont jamais calculés par le client.
 

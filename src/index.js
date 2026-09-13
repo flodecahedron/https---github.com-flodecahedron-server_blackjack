@@ -566,6 +566,6 @@ for (const authRecord of await store.loadAuthAccounts()) {
   if (authRecord.googleSub) playerByGoogleSubject.set(authRecord.googleSub, authRecord.playerId);
 }
 server.listen(process.env.PORT || 3000, () => {
-  console.log(`Blackjack server listening with ${process.env.DATABASE_URL ? "PostgreSQL" : "file"} persistence; Google auth ${isGoogleAuthConfigured() ? "enabled" : "disabled"}; Play Integrity ${PLAY_INTEGRITY_MODE}${isPlayIntegrityConfigured() ? "" : " (not configured)"}`);
+  console.log(`BeDealer server listening with ${process.env.DATABASE_URL ? "PostgreSQL" : "file"} persistence; Google auth ${isGoogleAuthConfigured() ? "enabled" : "disabled"}; Play Integrity ${PLAY_INTEGRITY_MODE}${isPlayIntegrityConfigured() ? "" : " (not configured)"}`);
   if (PLAY_INTEGRITY_MODE === "audit" && !isPlayIntegrityConfigured()) console.warn("[integrity] Audit is enabled but server credentials or GOOGLE_CLOUD_PROJECT_NUMBER are missing");
 });
