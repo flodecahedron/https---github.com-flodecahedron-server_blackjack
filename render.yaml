@@ -46,7 +46,7 @@ services:
       - key: MESSAGE_LIMIT_PER_10S
         value: "40"
       - key: STATE_ACTION_LIMIT_PER_10S
-        value: "15"
+        value: "100"
       - key: LOG_WS_MESSAGES
         value: "false"
       - key: TRAFFIC_METRICS_INTERVAL_SECONDS
